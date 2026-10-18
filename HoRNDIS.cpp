@@ -1512,6 +1512,15 @@ static inline bool isTransferStopStatus(IOReturn rc) {
 	return rc == kIOReturnAborted || rc == kIOReturnNotResponding;
 }
 
+// Split 'm' at 'offset' bytes: 'm' keeps the first half, '*tail' receives
+// the second half (modern mbuf_split signature: errno_t + output param).
+// Returns true on success; on failure the original chain is preserved and
+// '*tail' is NULL.
+static inline bool splitMbuf(mbuf_t m, size_t offset, mbuf_t *tail) {
+	*tail = NULL;
+	return mbuf_split(m, offset, MBUF_WAITOK, tail) == 0;
+}
+
 // TX aggregation helpers. Everything below runs on the workloop; the command
 // gate serializes outputPacket, the flush timer and the pipe completions.
 
@@ -1570,6 +1579,9 @@ bool HoRNDIS::submitFillBuffer() {
 		// send it as a single transfer - no payload copy.
 		const uint32_t xmitLen = fTxBytes;
 		pipebuf_t &outbuf = outbufs[fTxFillBufIdx];
+		// 'mbuf_concatenate' does not maintain the packet-header length:
+		// fix it up so the descriptor reflects the real chain length.
+		mbuf_pkthdr_setlen(fTxHead, fTxBytes);
 		IOMbufMemoryDescriptor *mdp =
 			IOMbufMemoryDescriptor::withBuffer(fTxHead, kIODirectionOut);
 		if (!mdp) {
@@ -1902,15 +1914,21 @@ UInt32 HoRNDIS::outputPacket(mbuf_t packet, void *param) {
 	hdr->data_len = cpu_to_le32(pktlen);
 	mbuf_setlen(hdrM, sizeof *hdr);
 	mbuf_pkthdr_setlen(hdrM, sizeof *hdr);
-	if (mbuf_concatenate(hdrM, packet) != 0) {
+	// 'mbuf_concatenate' returns the merged chain (NULL only if dst was
+	// NULL, which cannot happen here) and does NOT maintain the packet
+	// header length - we track the aggregate length ourselves:
+	mbuf_t merged = mbuf_concatenate(hdrM, packet);
+	if (!merged) {
 		LOG(V_ERROR, "mbuf_concatenate failed");
 		fpNetStats->outputErrors++;
 		freePacket(hdrM);
 		freePacket(packet);
 		return kIOReturnOutputDropped;
 	}
+	hdrM = merged;
 	if (fTxHead) {
-		if (mbuf_concatenate(fTxHead, hdrM) != 0) {
+		merged = mbuf_concatenate(fTxHead, hdrM);
+		if (!merged) {
 			LOG(V_ERROR, "mbuf_concatenate (aggregate) failed");
 			fpNetStats->outputErrors++;
 			freePacket(fTxHead);
@@ -1919,6 +1937,7 @@ UInt32 HoRNDIS::outputPacket(mbuf_t packet, void *param) {
 			freePacket(hdrM);
 			return kIOReturnOutputDropped;
 		}
+		fTxHead = merged;
 	} else {
 		fTxHead = hdrM;
 	}
@@ -2209,13 +2228,11 @@ void HoRNDIS::receivePacketZeroCopy(mbuf_t m, UInt32 size) {
 		}
 
 		// Carve this PDU out of the chain. When it is the last one and fills
-		// the transfer exactly, there is nothing to split off (and
-		// 'mbuf_split' would return NULL in that boundary case), so we just
+		// the transfer exactly, there is nothing to split off, so we just
 		// consume the whole chain in place:
 		mbuf_t tail = NULL;
 		if (msg_len < size) {
-			tail = mbuf_split(m, msg_len);
-			if (!tail) {
+			if (!splitMbuf(m, msg_len, &tail)) {
 				LOG(V_ERROR, "mbuf_split failed");
 				break;
 			}
@@ -3107,8 +3124,8 @@ void HoRNDIS::ncmReceivePacket(mbuf_t m, UInt32 size) {
 
 			// Discard the region before the datagram (NTH/NDP/padding):
 			if (dgIndex > curOff) {
-				mbuf_t rest = mbuf_split(m, dgIndex - curOff);
-				if (!rest) {
+				mbuf_t rest = NULL;
+				if (!splitMbuf(m, dgIndex - curOff, &rest)) {
 					LOG(V_ERROR, "NCM RX: mbuf_split (pre) failed");
 					ok = false;
 					break;
@@ -3121,8 +3138,8 @@ void HoRNDIS::ncmReceivePacket(mbuf_t m, UInt32 size) {
 			// Carve out exactly the datagram:
 			mbuf_t dgram;
 			if ((uint32_t)mbuf_pkthdr_len(m) > (uint32_t)dgLen) {
-				mbuf_t tail = mbuf_split(m, dgLen);
-				if (!tail) {
+				mbuf_t tail = NULL;
+				if (!splitMbuf(m, dgLen, &tail)) {
 					LOG(V_ERROR, "NCM RX: mbuf_split (dgram) failed");
 					ok = false;
 					break;
