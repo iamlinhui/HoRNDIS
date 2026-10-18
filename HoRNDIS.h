@@ -40,9 +40,7 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
-#if TX_ZEROCOPY
 #include <IOKit/IOMultiMemoryDescriptor.h>
-#endif
 #include <IOKit/IOMessage.h>
 
 #include <IOKit/usb/IOUSBHostFamily.h>
