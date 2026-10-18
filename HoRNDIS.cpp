@@ -950,6 +950,9 @@ static inline IOReturn robustIO(IOUSBHostPipe *pipe, pipebuf_t *buf,
    resources when the interface is sitting disabled and unused. */
 IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 	IOReturn rtn = kIOReturnSuccess;
+	// Declared up here: 'goto bailout' must not jump over an
+	// initializer-bearing declaration (C++ rule).
+	int startedReads = 0;
 
 	LOG(V_DEBUG, "begin for thread_id=%lld", thread_tid(current_thread()));
 	ReentryLocker locker(this, fEnableDisableInProgress);
@@ -1007,7 +1010,7 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 	// Kick off the read requests ('startRead' guards slot readiness: a
 	// slot whose previous buffer is still draining simply does not start
 	// and is picked up later by the retry timer):
-	int startedReads = 0;
+	startedReads = 0;
 	for (int i = 0; i < N_IN_BUFS; i++) {
 		if (startRead(&inbufs[i])) {
 			startedReads++;
