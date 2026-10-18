@@ -2111,7 +2111,7 @@ void HoRNDIS::dataWriteComplete(void *obj, void *param, IOReturn rc, UInt32 tran
 		if (me->outbufs[poolIndx].dmaBuf != me->outbufs[poolIndx].mdp) {
 			me->outbufs[poolIndx].dmaBuf->release();
 		}
-		freePacket(me->outbufs[poolIndx].m);
+		me->freePacket(me->outbufs[poolIndx].m);
 		me->outbufs[poolIndx].m = NULL;
 	}
 	me->outbufs[poolIndx].dmaBuf = NULL;

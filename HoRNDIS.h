@@ -28,6 +28,7 @@
  */
 
 #include <machine/limits.h>			/* UINT_MAX */
+#include <libkern/OSAtomic.h>
 #include <libkern/OSByteOrder.h>
 #include <libkern/OSTypes.h>
 
