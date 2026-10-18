@@ -47,9 +47,14 @@ jobs:
         run: |
           /usr/sbin/kextutil -n build/Release/HoRNDIS.kext
 
+      - name: Stage the kext for upload
+        run: |
+          rm -rf HoRNDIS.kext
+          cp -R build/Release/HoRNDIS.kext .
+
       - name: Upload the kext artifact
         uses: actions/upload-artifact@v4
         with:
           name: HoRNDIS-${{ matrix.runner }}
-          path: build/Release/HoRNDIS.kext
+          path: HoRNDIS.kext
           if-no-files-found: error
