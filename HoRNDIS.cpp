@@ -1211,7 +1211,7 @@ bool HoRNDIS::createMediumTables(const IONetworkMedium **primary) {
 	// instead of always claiming USB2 High-Speed (480 Mb/s).
 	uint64_t speed = 480 * 1000000ULL;
 	if (fDataInterface && fDataInterface->getDevice() &&
-		fDataInterface->getDevice()->getSpeed() == kUSBDeviceSpeedSuper) {
+		fDataInterface->getDevice()->getSpeed() >= kIOUSBHostConnectionSpeedSuper) {
 		speed = 5000 * 1000000ULL;
 	}
 
@@ -1560,7 +1560,9 @@ static IOMemoryDescriptor *descriptorForChain(mbuf_t m) {
 	}
 	int i = 0;
 	for (mbuf_t p = m; p && i < n; p = mbuf_next(p), i++) {
-		OSPtr<IOMemoryDescriptor> d = IOMemoryDescriptor::withAddress(
+		// Note: OSPtr<T> is a plain T* unless IOKIT_ENABLE_SHARED_PTR is
+		// defined, so this is an ordinary retained pointer.
+		IOMemoryDescriptor *d = IOMemoryDescriptor::withAddress(
 			(void *)mbuf_data(p), mbuf_len(p), kIODirectionOut);
 		if (!d) {
 			for (int j = 0; j < i; j++) {
@@ -1569,7 +1571,7 @@ static IOMemoryDescriptor *descriptorForChain(mbuf_t m) {
 			IOFree(descs, sizeof(IOMemoryDescriptor *) * n);
 			return NULL;
 		}
-		descs[i] = d.detach();  // Transfer our ref into the array.
+		descs[i] = d;  // The array holds the ref.
 	}
 	IOMemoryDescriptor *md = IOMultiMemoryDescriptor::withDescriptors(
 		descs, n, kIODirectionOut, false);
@@ -1690,7 +1692,8 @@ bool HoRNDIS::submitFillBuffer() {
 			fTxBytes = 0;
 			return true;  // Keep the (now empty) fill slot.
 		}
-		md->setLength(xmitLen);
+		// The descriptor length is the sum of the per-mbuf lengths, which
+		// equals 'fTxBytes' by construction: no setLength needed.
 		outbuf.m = fTxHead;
 		outbuf.dmaBuf = md;
 		outbuf.pipe = outPipe;
@@ -1737,7 +1740,9 @@ bool HoRNDIS::submitFillBuffer() {
 			ncmFlushNtb();
 		}
 #endif
-		outbuf.dmaBuf->setLength(fTxFillOffset);
+		// 'setLength' is an IOBufferMemoryDescriptor method; the fill
+		// buffer IS the wired descriptor here.
+		outbuf.mdp->setLength(fTxFillOffset);
 
 		IOUSBHostCompletion *const comp = &outbuf.comp;
 		comp->owner     = this;
