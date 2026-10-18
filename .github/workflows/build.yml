@@ -1,0 +1,55 @@
+# Builds the kext on macOS CI so that every push gets a compile check
+# without needing a local Mac. Two runners cover both architectures:
+#   macos-13 = Intel (x86_64),  macos-14 = Apple Silicon (arm64).
+#
+# NOTE: GitHub-hosted macOS runners run with SIP enabled, so the kext
+# cannot be *loaded* here - this pipeline verifies that it BUILDS and
+# links against the kernel KPIs. Runtime verification happens on a real
+# Mac (see README "Verifying a build").
+
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build-kext:
+    name: Build (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-13, macos-14]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the kext (Release)
+        run: |
+          xcodebuild -project HoRNDIS.xcodeproj \
+            -target HoRNDIS \
+            -configuration Release \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            SDKROOT=macosx \
+            MACOSX_DEPLOYMENT_TARGET=10.13 \
+            build
+
+      - name: Verify the product
+        run: |
+          ls -la build/Release/HoRNDIS.kext
+          # Print the KPI libraries the kext links against:
+          /usr/sbin/kextlibs -xml build/Release/HoRNDIS.kext | head -40
+
+      - name: Link-check without loading (non-fatal)
+        continue-on-error: true
+        run: |
+          /usr/sbin/kextutil -n build/Release/HoRNDIS.kext
+
+      - name: Upload the kext artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HoRNDIS-${{ matrix.runner }}
+          path: build/Release/HoRNDIS.kext
+          if-no-files-found: error
