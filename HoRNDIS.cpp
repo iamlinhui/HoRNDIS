@@ -244,10 +244,8 @@ bool HoRNDIS::init(OSDictionary *properties) {
 	fIntPipe = NULL;
 	fIntBuf.mdp = NULL;
 	fIntBuf.dmaBuf = NULL;
-#if RX_ZEROCOPY
-	fIntBuf.mbufMdp = NULL;
-	fIntBuf.m = NULL;
-#endif
+	fIntBuf.lease = NULL;
+	fIntBuf.inFlight = false;
 	fIntReadActive = false;
 
 	fCmdInProgress = false;
@@ -267,15 +265,18 @@ bool HoRNDIS::init(OSDictionary *properties) {
 	for (int i = 0; i < N_OUT_BUFS; i++) {
 		outbufs[i].mdp = NULL;
 		outbufs[i].dmaBuf = NULL;
+		outbufs[i].lease = NULL;
+		outbufs[i].inFlight = false;
+#if TX_ZEROCOPY
+		outbufs[i].m = NULL;
+#endif
 		outbufStack[i] = i;  // Value does not matter here.
 	}
 	for (int i = 0 ; i < N_IN_BUFS; i++) {
 		inbufs[i].mdp = NULL;
 		inbufs[i].dmaBuf = NULL;
-#if RX_ZEROCOPY
-		inbufs[i].mbufMdp = NULL;
-		inbufs[i].m = NULL;
-#endif
+		inbufs[i].lease = NULL;
+		inbufs[i].inFlight = false;
 	}
 
 	fTxFillBufIdx = -1;
@@ -1003,12 +1004,22 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 	}
 #endif
 	
-	// Kick off the read requests:
+	// Kick off the read requests ('startRead' guards slot readiness: a
+	// slot whose previous buffer is still draining simply does not start
+	// and is picked up later by the retry timer):
+	int startedReads = 0;
 	for (int i = 0; i < N_IN_BUFS; i++) {
-		if (!startRead(&inbufs[i])) {
-			LOG(V_ERROR, "Failed to start the first read (slot %d)", i);
-			goto bailout;
+		if (startRead(&inbufs[i])) {
+			startedReads++;
 		}
+	}
+	if (startedReads == 0) {
+		LOG(V_ERROR, "Failed to start any read");
+		goto bailout;
+	}
+	if (startedReads < N_IN_BUFS) {
+		fNeedReadRestart = true;
+		armTxFlushTimer();
 	}
 
 	// Tell the world that the link is up...
@@ -1235,18 +1246,29 @@ bool HoRNDIS::allocateResources() {
 	}
 #endif
 	for (int i = 0; i < N_IN_BUFS; i++) {
-#if RX_ZEROCOPY
-		// Zero-copy RX buffers are mbuf packets, allocated per-transfer in
-		// 'startRead': nothing to preallocate here.
-#else
-		inbufs[i].mdp = IOBufferMemoryDescriptor::withCapacity(inSize, kIODirectionIn);
-		if (!inbufs[i].mdp) {
-			return false;
+		// If a previous lease is still outstanding (the network stack
+		// holds cluster references into it), keep it: it drains on its
+		// own and the slot becomes usable again when the count hits 0.
+		if (inbufs[i].lease == NULL) {
+			RxBufLease *lease = (RxBufLease *)IOMalloc(sizeof(RxBufLease));
+			if (!lease) {
+				return false;
+			}
+			lease->mdp = IOBufferMemoryDescriptor::withCapacity(
+				inSize, kIODirectionIn);
+			if (!lease->mdp) {
+				IOFree(lease, sizeof(*lease));
+				return false;
+			}
+			lease->mdp->setLength(inSize);
+			lease->count = 0;
+			lease->freeWhenDone = false;
+			inbufs[i].lease = lease;
+			inbufs[i].mdp = lease->mdp;
+			LOG(V_PTR, "PTR: inbuf[%d].mdp: %p", i, inbufs[i].mdp);
 		}
-		inbufs[i].mdp->setLength(inSize);
 		inbufs[i].dmaBuf = inbufs[i].mdp;
-		LOG(V_PTR, "PTR: inbuf[%d].mdp: %p", i, inbufs[i].mdp);
-#endif
+		inbufs[i].inFlight = false;
 	}
 
 	// Interrupt reader buffer for the control interface (optional: when the
@@ -1318,9 +1340,12 @@ void HoRNDIS::releaseResources() {
 		OSSafeReleaseNULL(outbufs[i].mdp);
 #if TX_ZEROCOPY
 		// Leftover in-flight chains (aborted writes are not freed by their
-		// completion, see 'dataWriteComplete'):
-		OSSafeReleaseNULL(outbufs[i].mbufMdp);
+		// completion, see 'dataWriteComplete'): the scatter-gather
+		// descriptor goes away together with the chain.
 		if (outbufs[i].m) {
+			if (outbufs[i].dmaBuf != outbufs[i].mdp) {
+				outbufs[i].dmaBuf->release();
+			}
 			freePacket(outbufs[i].m);
 			outbufs[i].m = NULL;
 		}
@@ -1331,21 +1356,27 @@ void HoRNDIS::releaseResources() {
 	numFreeOutBufs = 0;
 
 	for (int i = 0; i < N_IN_BUFS; i++) {
-#if RX_ZEROCOPY
-		if (inbufs[i].m) {
-			freePacket(inbufs[i].m);
-			inbufs[i].m = NULL;
+		inbufs[i].inFlight = false;
+		inbufs[i].dmaBuf = NULL;
+		RxBufLease *lease = inbufs[i].lease;
+		if (lease) {
+			if (lease->count == 0) {
+				lease->mdp->release();
+				IOFree(lease, sizeof(*lease));
+			} else {
+				// Outstanding cluster references: the mbuf free callback
+				// retires the lease once the last one is released.
+				lease->freeWhenDone = true;
+			}
+			inbufs[i].lease = NULL;
+			inbufs[i].mdp = NULL;
 		}
-		OSSafeReleaseNULL(inbufs[i].mbufMdp);
-		inbufs[i].dmaBuf = NULL;
-#else
-		OSSafeReleaseNULL(inbufs[i].mdp);
-		inbufs[i].dmaBuf = NULL;
-#endif
 	}
 
 	OSSafeReleaseNULL(fIntBuf.mdp);
 	fIntBuf.dmaBuf = NULL;
+	fIntBuf.lease = NULL;
+	fIntBuf.inFlight = false;
 }
 
 IOOutputQueue *HoRNDIS::createOutputQueue() {
@@ -1512,14 +1543,83 @@ static inline bool isTransferStopStatus(IOReturn rc) {
 	return rc == kIOReturnAborted || rc == kIOReturnNotResponding;
 }
 
-// Split 'm' at 'offset' bytes: 'm' keeps the first half, '*tail' receives
-// the second half (modern mbuf_split signature: errno_t + output param).
-// Returns true on success; on failure the original chain is preserved and
-// '*tail' is NULL.
-static inline bool splitMbuf(mbuf_t m, size_t offset, mbuf_t *tail) {
-	*tail = NULL;
-	return mbuf_split(m, offset, MBUF_WAITOK, tail) == 0;
+#if TX_ZEROCOPY
+// Build a scatter-gather descriptor over an mbuf chain using per-mbuf
+// 'withAddress' descriptors combined by 'IOMultiMemoryDescriptor'
+// (IOMbufMemoryDescriptor was removed from modern SDKs). Returns a
+// descriptor with +1 ref for the caller, or NULL.
+static IOMemoryDescriptor *descriptorForChain(mbuf_t m) {
+	int n = 0;
+	for (mbuf_t p = m; p; p = mbuf_next(p)) {
+		n++;
+	}
+	IOMemoryDescriptor **descs =
+		(IOMemoryDescriptor **)IOMalloc(sizeof(IOMemoryDescriptor *) * n);
+	if (!descs) {
+		return NULL;
+	}
+	int i = 0;
+	for (mbuf_t p = m; p && i < n; p = mbuf_next(p), i++) {
+		OSPtr<IOMemoryDescriptor> d = IOMemoryDescriptor::withAddress(
+			(void *)mbuf_data(p), mbuf_len(p), kIODirectionOut);
+		if (!d) {
+			for (int j = 0; j < i; j++) {
+				descs[j]->release();
+			}
+			IOFree(descs, sizeof(IOMemoryDescriptor *) * n);
+			return NULL;
+		}
+		descs[i] = d.detach();  // Transfer our ref into the array.
+	}
+	IOMemoryDescriptor *md = IOMultiMemoryDescriptor::withDescriptors(
+		descs, n, kIODirectionOut, false);
+	// The multi descriptor retained the sub-descriptors (asReference =
+	// false): release the array's refs.
+	for (int j = 0; j < n; j++) {
+		descs[j]->release();
+	}
+	IOFree(descs, sizeof(IOMemoryDescriptor *) * n);
+	return md;
 }
+#endif
+
+#if RX_ZEROCOPY || NCM_SUPPORT
+// Called when the last mbuf cluster referencing a zero-copy RX buffer is
+// freed: retire the lease (and its buffer) if teardown requested it.
+void HoRNDIS::rxClusterFreed(caddr_t extbuf, u_int extsize, caddr_t extarg) {
+	RxBufLease *lease = (RxBufLease *)extarg;
+	if (OSAddAtomic(-1, &lease->count) == 0 && lease->freeWhenDone) {
+		lease->mdp->release();
+		IOFree(lease, sizeof(*lease));
+	}
+}
+
+// Hand a region of a zero-copy RX buffer to the network stack: a
+// packet-header mbuf plus an attachclustered data mbuf referencing the
+// region - no data copy. Returns false on allocation failure (the lease
+// count is NOT incremented in that case).
+bool HoRNDIS::submitClusterPacket(uint8_t *data, UInt32 len,
+	RxBufLease *lease) {
+	// Completion context: blocking allocation is fine (thread context).
+	mbuf_t hdrM = NULL;
+	if (mbuf_gethdr(MBUF_WAITOK, MBUF_TYPE_DATA, &hdrM) != 0) {
+		return false;
+	}
+	mbuf_t dataM = NULL;
+	if (mbuf_attachcluster(MBUF_WAITOK, MBUF_TYPE_DATA, &dataM,
+			(caddr_t)data, &HoRNDIS::rxClusterFreed, len,
+			(caddr_t)lease) != 0) {
+		freePacket(hdrM);
+		return false;
+	}
+	OSIncrementAtomic(&lease->count);
+	mbuf_concatenate(hdrM, dataM);
+	mbuf_pkthdr_setlen(hdrM, len);
+	fNetworkInterface->inputPacket(hdrM, len);
+	fpNetStats->inputPackets++;
+	return true;
+}
+#endif
 
 // TX aggregation helpers. Everything below runs on the workloop; the command
 // gate serializes outputPacket, the flush timer and the pipe completions.
@@ -1575,26 +1675,24 @@ bool HoRNDIS::submitFillBuffer() {
 
 #if TX_ZEROCOPY
 	if (fProtocol == kProtocolRNDIS && fTxHead != NULL && fTxBytes > 0) {
-		// Zero-copy TX: wrap the mbuf chain in a memory descriptor and
-		// send it as a single transfer - no payload copy.
+		// Zero-copy TX: wrap the mbuf chain in a scatter-gather descriptor
+		// and send it as a single transfer - no payload copy.
 		const uint32_t xmitLen = fTxBytes;
 		pipebuf_t &outbuf = outbufs[fTxFillBufIdx];
 		// 'mbuf_concatenate' does not maintain the packet-header length:
-		// fix it up so the descriptor reflects the real chain length.
+		// keep it consistent for any consumer that looks at it.
 		mbuf_pkthdr_setlen(fTxHead, fTxBytes);
-		IOMbufMemoryDescriptor *mdp =
-			IOMbufMemoryDescriptor::withBuffer(fTxHead, kIODirectionOut);
-		if (!mdp) {
-			LOG(V_ERROR, "IOMbufMemoryDescriptor::withBuffer failed");
+		IOMemoryDescriptor *md = descriptorForChain(fTxHead);
+		if (!md) {
+			LOG(V_ERROR, "descriptorForChain failed");
 			freePacket(fTxHead);
 			fTxHead = NULL;
 			fTxBytes = 0;
 			return true;  // Keep the (now empty) fill slot.
 		}
-		mdp->setLength(xmitLen);
+		md->setLength(xmitLen);
 		outbuf.m = fTxHead;
-		outbuf.mbufMdp = mdp;
-		outbuf.dmaBuf = mdp;
+		outbuf.dmaBuf = md;
 		outbuf.pipe = outPipe;
 		fTxHead = NULL;
 		fTxBytes = 0;
@@ -1612,11 +1710,10 @@ bool HoRNDIS::submitFillBuffer() {
 				LOG(V_ERROR, "write failed: %08x", ior);
 				fpNetStats->outputErrors++;
 			}
-			outbuf.mbufMdp->release();
-			outbuf.mbufMdp = NULL;
+			outbuf.dmaBuf->release();
+			outbuf.dmaBuf = NULL;
 			freePacket(outbuf.m);
 			outbuf.m = NULL;
-			outbuf.dmaBuf = NULL;
 			outbufStack[numFreeOutBufs] = (uint16_t)fTxFillBufIdx;
 			numFreeOutBufs++;
 			fTxFillBufIdx = -1;
@@ -1712,14 +1809,14 @@ void HoRNDIS::txFlushTimerFired(OSObject *owner, IOTimerEventSource *timer) {
 #endif
 
 #if RX_ZEROCOPY
-	// RX: retry reads that failed to re-arm due to allocation failures.
+	// RX: retry reads that could not be re-armed (all slots busy or their
+	// buffers still referenced by the network stack). 'startRead' guards
+	// slot readiness itself.
 	if (me->fNeedReadRestart) {
 		me->fNeedReadRestart = false;
 		for (int i = 0; i < N_IN_BUFS; i++) {
-			if (me->inbufs[i].m == NULL) {
-				if (!me->startRead(&me->inbufs[i])) {
-					me->fNeedReadRestart = true;
-				}
+			if (!me->startRead(&me->inbufs[i])) {
+				me->fNeedReadRestart = true;
 			}
 		}
 		if (me->fNeedReadRestart) {
@@ -1731,11 +1828,17 @@ void HoRNDIS::txFlushTimerFired(OSObject *owner, IOTimerEventSource *timer) {
 
 // Allocate an RX buffer and submit a read on it. On success the callback
 // count is bumped (one more in-flight transfer). The slot's 'pipe' must
-// have been assigned by the caller ('enable').
+// have been assigned by the caller ('enable'). The slot must be free: no
+// transfer outstanding and no cluster references into its buffer.
 bool HoRNDIS::startRead(pipebuf_t *inbuf) {
 	inbuf->comp.owner = this;
 	inbuf->comp.action = dataReadComplete;
 	inbuf->comp.parameter = inbuf;
+
+	if (inbuf->inFlight || !inbuf->mdp ||
+		(inbuf->lease && inbuf->lease->count != 0)) {
+		return false;
+	}
 
 	// RX transfer size: NCM uses the negotiated NTB input size:
 	uint32_t rxLen = IN_BUF_SIZE;
@@ -1745,48 +1848,24 @@ bool HoRNDIS::startRead(pipebuf_t *inbuf) {
 	}
 #endif
 
-#if RX_ZEROCOPY
-	mbuf_t m = allocatePacket(rxLen);
-	if (!m) {
-		LOG(V_ERROR, "allocatePacket(%d) failed", rxLen);
-		return false;
-	}
-	IOMbufMemoryDescriptor *mdp = IOMbufMemoryDescriptor::withBuffer(m, kIODirectionIn);
-	if (!mdp) {
-		LOG(V_ERROR, "IOMbufMemoryDescriptor::withBuffer failed");
-		freePacket(m);
-		return false;
-	}
-	inbuf->m = m;
-	inbuf->mbufMdp = mdp;
-	inbuf->dmaBuf = mdp;
-	IOReturn rtn = robustIO(inbuf->pipe, inbuf, rxLen);
-#else
 	inbuf->dmaBuf = inbuf->mdp;
-	IOReturn rtn = robustIO(inbuf->pipe, inbuf, (uint32_t)inbuf->mdp->getLength());
-#endif
+	IOReturn rtn = robustIO(inbuf->pipe, inbuf, rxLen);
 	if (rtn != kIOReturnSuccess) {
 		LOG(V_ERROR, "Failed to start a read: %08x", rtn);
 		releaseReadBuffer(inbuf);
 		return false;
 	}
+	inbuf->inFlight = true;
 	fCallbackCount++;
 	return true;
 }
 
 // Release the RX resources held by a slot (used on read teardown).
 void HoRNDIS::releaseReadBuffer(pipebuf_t *inbuf) {
-#if RX_ZEROCOPY
-	if (inbuf->m) {
-		freePacket(inbuf->m);
-		inbuf->m = NULL;
-	}
-	OSSafeReleaseNULL(inbuf->mbufMdp);
+	// The buffer descriptor itself is owned by the lease (zero-copy) or by
+	// allocate/releaseResources (copy mode); nothing to free here.
+	inbuf->inFlight = false;
 	inbuf->dmaBuf = NULL;
-#else
-	// The buffer descriptor itself is owned by allocate/releaseResources.
-	inbuf->dmaBuf = NULL;
-#endif
 }
 
 UInt32 HoRNDIS::outputPacket(mbuf_t packet, void *param) {
@@ -2022,9 +2101,11 @@ void HoRNDIS::dataWriteComplete(void *obj, void *param, IOReturn rc, UInt32 tran
 	}
 
 #if TX_ZEROCOPY
-	// Zero-copy TX: release the mbuf chain + descriptor held by the slot:
-	OSSafeReleaseNULL(me->outbufs[poolIndx].mbufMdp);
+	// Zero-copy TX: release the scatter-gather descriptor and the chain:
 	if (me->outbufs[poolIndx].m) {
+		if (me->outbufs[poolIndx].dmaBuf != me->outbufs[poolIndx].mdp) {
+			me->outbufs[poolIndx].dmaBuf->release();
+		}
 		freePacket(me->outbufs[poolIndx].m);
 		me->outbufs[poolIndx].m = NULL;
 	}
@@ -2057,44 +2138,44 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 	}
 
 #if RX_ZEROCOPY
-	// Detach the completed packet from the slot BEFORE re-arming, so that a
-	// failed re-arm leaves the slot in a clean, retryable state:
-	mbuf_t data = inbuf->m;
-	IOMbufMemoryDescriptor *mdp = inbuf->mbufMdp;
-	inbuf->m = NULL;
-	inbuf->mbufMdp = NULL;
+	inbuf->inFlight = false;
 	inbuf->dmaBuf = NULL;
-	OSSafeReleaseNULL(mdp);  // Descriptor's job is done; the mbuf holds the data.
-
-	// Re-arm the read first: keeps the RX pipeline full.
-	bool rearmed = me->startRead(inbuf);
-	if (!rearmed) {
-		me->fNeedReadRestart = true;
-		me->armTxFlushTimer();  // Retry tick (see 'txFlushTimerFired').
-	}
 
 	if (rc == kIOReturnSuccess) {
-		// Hand the transfer to the parser; it takes ownership of 'data'.
+		// Hand the buffer to the parser; it attaches cluster mbufs into it
+		// (the lease refcount gates buffer reuse until the network stack
+		// is done with every packet).
 		LOG(V_PACKET, "Reader(%ld), tid=%lld: %d bytes", inbuf - me->inbufs,
 			thread_tid(current_thread()), transferred);
 #if NCM_SUPPORT
 		if (me->fProtocol == kProtocolNCM) {
-			me->ncmReceivePacket(data, transferred);
+			me->ncmReceivePacket(inbuf, transferred);
 		} else
 #endif
 		{
-			me->receivePacketZeroCopy(data, transferred);
+			me->receivePacketZeroCopy(inbuf, transferred);
 		}
 	} else {
 		LOG(V_ERROR, "dataReadComplete: I/O error: %08x", rc);
-		freePacket(data);
 	}
 
+	// Re-arm any free slot (this one is typically refcounted now):
+	bool rearmed = false;
+	for (int i = 0; i < N_IN_BUFS; i++) {
+		if (me->startRead(&me->inbufs[i])) {
+			rearmed = true;
+			break;
+		}
+	}
 	if (rearmed) {
 		return;  // Callback continues via the new read.
 	}
+	me->fNeedReadRestart = true;
+	me->armTxFlushTimer();  // Retry tick (see 'txFlushTimerFired').
 	me->callbackExit();
 #else
+	inbuf->inFlight = false;
+	inbuf->dmaBuf = NULL;
 	if (rc == kIOReturnSuccess) {
 		// Got one?  Hand it to the back end.
 		LOG(V_PACKET, "Reader(%ld), tid=%lld: %d bytes", inbuf - me->inbufs,
@@ -2107,6 +2188,7 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 	// Queue the next one up.
 	IOReturn ior = robustIO(inbuf->pipe, inbuf, (uint32_t)inbuf->mdp->getLength());
 	if (ior == kIOReturnSuccess) {
+		inbuf->inFlight = true;
 		return;  // Callback is in-progress.
 	}
 
@@ -2182,81 +2264,60 @@ void HoRNDIS::receivePacket(void *packet, UInt32 size) {
 	}
 }
 
-#if RX_ZEROCOPY
+#if RX_ZEROCOPY || NCM_SUPPORT
 /*!
- * Zero-copy variant of 'receivePacket': the transfer already landed in an
- * mbuf packet (see 'startRead'). Each RNDIS PDU is carved out of the chain
- * with 'mbuf_split', the RNDIS header is stripped with 'mbuf_adj', and the
- * resulting mbuf is handed straight to the network stack - no data copy.
- * Takes ownership of 'm' in all cases.
+ * Zero-copy RNDIS receive: the transfer landed in the slot's wired buffer
+ * ('slot->mdp'). Each PDU is handed to the network stack as an mbuf whose
+ * cluster references the buffer directly ('submitClusterPacket') - no data
+ * copy. The slot's lease refcount keeps the buffer alive until the stack
+ * releases every packet.
  */
-void HoRNDIS::receivePacketZeroCopy(mbuf_t m, UInt32 size) {
-	if (size == 0) {
-		freePacket(m);
-		return;
-	}
+void HoRNDIS::receivePacketZeroCopy(pipebuf_t *slot, UInt32 size) {
+	uint8_t *packet = (uint8_t *)slot->mdp->getBytesNoCopy();
+
+	LOG(V_PACKET, "packet sz %d", (int)size);
 
 	while (size) {
-		struct rndis_data_hdr hdr;
+		struct rndis_data_hdr *hdr = (struct rndis_data_hdr *)packet;
 		uint32_t msg_len, data_ofs, data_len;
 
-		if (size <= sizeof(hdr)) {
-			LOG(V_ERROR, "receivePacket() on too small packet? (size %d)", size);
-			break;
+		if (size <= sizeof(struct rndis_data_hdr)) {
+			LOG(V_ERROR, "receivePacket() on too small packet? (size %d)",
+				size);
+			return;
 		}
 
-		mbuf_copydata(m, 0, sizeof(hdr), &hdr);
+		msg_len = le32_to_cpu(hdr->msg_len);
+		data_ofs = le32_to_cpu(hdr->data_offset);
+		data_len = le32_to_cpu(hdr->data_len);
 
-		msg_len = le32_to_cpu(hdr.msg_len);
-		data_ofs = le32_to_cpu(hdr.data_offset);
-		data_len = le32_to_cpu(hdr.data_len);
-
-		if (hdr.msg_type != RNDIS_MSG_PACKET) { // both are LE, so that's okay
+		if (hdr->msg_type != RNDIS_MSG_PACKET) { // both are LE, so that's okay
 			LOG(V_ERROR, "non-PACKET over data channel? (msg_type %08x)",
-				le32_to_cpu(hdr.msg_type));
-			break;
+				le32_to_cpu(hdr->msg_type));
+			return;
 		}
 
-		if (msg_len > size || msg_len < sizeof(hdr)) {
+		if (msg_len > size || msg_len < sizeof(struct rndis_data_hdr)) {
 			LOG(V_ERROR, "msg_len too big (or too small)?");
-			break;
+			return;
 		}
 
 		if (data_len == 0 || (data_ofs + data_len + 8) > msg_len) {
 			LOG(V_ERROR, "data bigger than msg?");
-			break;
+			return;
 		}
 
-		// Carve this PDU out of the chain. When it is the last one and fills
-		// the transfer exactly, there is nothing to split off, so we just
-		// consume the whole chain in place:
-		mbuf_t tail = NULL;
-		if (msg_len < size) {
-			if (!splitMbuf(m, msg_len, &tail)) {
-				LOG(V_ERROR, "mbuf_split failed");
-				break;
-			}
+		if (!submitClusterPacket(packet + data_ofs + 8, data_len,
+				slot->lease)) {
+			LOG(V_ERROR, "submitClusterPacket for data_len %d failed",
+				data_len);
+			fpNetStats->inputErrors++;
+			return;
 		}
-		// 'm' is now exactly this PDU's message. Strip the RNDIS header
-		// from the front, and any trailing padding from the end (negative
-		// mbuf_adj trims the chain tail and fixes up the packet length):
-		mbuf_adj(m, data_ofs + 8);
-		size_t leftover = mbuf_pkthdr_len(m) - data_len;
-		if (leftover > 0) {
-			mbuf_adj(m, -(int)leftover);
-		}
-
 		LOG(V_PACKET, "submitted pkt sz %d", data_len);
-		fNetworkInterface->inputPacket(m, data_len);
-		fpNetStats->inputPackets++;
 
-		m = tail;
 		size -= msg_len;
-	}
-
-	// Drop whatever could not be consumed (malformed remainder or empty tail):
-	if (m) {
-		freePacket(m);
+		packet += msg_len;
 	}
 }
 #endif
@@ -2826,7 +2887,7 @@ IOReturn HoRNDIS::ncmControlRequest(uint8_t bRequest, uint16_t wValue,
 // Initial one-time device setup; mirrors Linux cdc_ncm.c 'cdc_ncm_init'.
 bool HoRNDIS::ncmInit() {
 #if !RX_ZEROCOPY
-	// The NCM RX path is zero-copy only (mbuf_split-based parsing); build
+	// The NCM RX path is zero-copy only (cluster-mbuf based); build
 	// with RX_ZEROCOPY=1 or disable NCM_SUPPORT.
 	LOG(V_ERROR, "NCM support requires RX_ZEROCOPY=1");
 	return false;
@@ -3026,25 +3087,25 @@ void HoRNDIS::ncmFlushNtb() {
 }
 
 // Parse a received NTB and hand its datagrams to the network stack.
-// Zero-copy: datagrams are carved out with 'mbuf_split' and no data is
-// copied. Takes ownership of 'm' in all cases.
-void HoRNDIS::ncmReceivePacket(mbuf_t m, UInt32 size) {
+// Zero-copy: each datagram becomes a cluster mbuf referencing the buffer
+// directly ('submitClusterPacket'). The slot's lease refcount keeps the
+// buffer alive until the stack releases every packet.
+void HoRNDIS::ncmReceivePacket(pipebuf_t *slot, UInt32 size) {
+	uint8_t *buf = (uint8_t *)slot->mdp->getBytesNoCopy();
+
 	if (size == 0) {
-		freePacket(m);
 		return;
 	}
 
 	struct ncm_nth16 nth;
 	if (size < sizeof(nth)) {
 		LOG(V_ERROR, "NCM RX: transfer too small (%d)", size);
-		freePacket(m);
 		return;
 	}
-	mbuf_copydata(m, 0, sizeof(nth), &nth);
+	memcpy(&nth, buf, sizeof(nth));
 	if (nth.dwSignature != cpu_to_le32(USB_CDC_NCM_NTH16_SIGN)) {
 		LOG(V_ERROR, "NCM RX: bad NTH signature %08x",
 			le32_to_cpu(nth.dwSignature));
-		freePacket(m);
 		return;
 	}
 	uint16_t hdrLen = le16_to_cpu(nth.wHeaderLength);
@@ -3052,115 +3113,57 @@ void HoRNDIS::ncmReceivePacket(mbuf_t m, UInt32 size) {
 	if (hdrLen != sizeof(nth) || blockLen < hdrLen || blockLen > size) {
 		LOG(V_ERROR, "NCM RX: bad NTH lengths (hdr %d, block %d, size %d)",
 			hdrLen, blockLen, size);
-		freePacket(m);
 		return;
 	}
 	uint16_t ndpIndex = le16_to_cpu(nth.wNdpIndex);
 	if (ndpIndex < hdrLen || ndpIndex + 8 > blockLen) {
 		LOG(V_ERROR, "NCM RX: bad NDP index %d", ndpIndex);
-		freePacket(m);
 		return;
 	}
 
 	// Walk the (possibly chained) NDPs and extract the datagrams:
-	uint32_t curOff = 0;  // Absolute offset of the head of 'm'.
-	bool ok = true;
-	while (ndpIndex != 0 && ok) {
+	while (ndpIndex != 0) {
 		struct ncm_ndp16 ndp;
-		if (ndpIndex + 8 > blockLen || ndpIndex < curOff) {
+		if (ndpIndex + 8 > blockLen) {
 			LOG(V_ERROR, "NCM RX: NDP out of bounds");
-			ok = false;
-			break;
+			return;
 		}
-		mbuf_copydata(m, ndpIndex - curOff, 8, &ndp);
+		memcpy(&ndp, buf + ndpIndex, sizeof(ndp));
 		if (ndp.dwSignature != cpu_to_le32(USB_CDC_NCM_NDP16_NOCRC_SIGN) &&
 			ndp.dwSignature != cpu_to_le32(USB_CDC_NCM_NDP16_CRC_SIGN)) {
 			LOG(V_ERROR, "NCM RX: bad NDP signature %08x",
 				le32_to_cpu(ndp.dwSignature));
-			ok = false;
-			break;
+			return;
 		}
 		uint16_t ndpLen = le16_to_cpu(ndp.wLength);
 		uint16_t nextNdp = le16_to_cpu(ndp.wNextNdpIndex);
 		if (ndpLen < sizeof(ndp) + 4 || ndpIndex + ndpLen > blockLen) {
 			LOG(V_ERROR, "NCM RX: bad NDP length %d", ndpLen);
-			ok = false;
-			break;
+			return;
 		}
 
-		// Snapshot the entry table BEFORE consuming the chain (the NDP
-		// region itself is discarded with the first split):
-		struct {
-			uint16_t index;
-			uint16_t len;
-		} dgrams[NCM_DPT_DATAGRAMS_MAX];
-		uint16_t nDgrams = 0;
 		uint16_t nEntries = (ndpLen - sizeof(ndp)) / 4;  // Includes terminator.
-		for (uint16_t i = 0;
-			i < nEntries && nDgrams < NCM_DPT_DATAGRAMS_MAX; i++) {
+		for (uint16_t i = 0; i < nEntries; i++) {
 			uint16_t vals[2];
-			mbuf_copydata(m, ndpIndex + sizeof(ndp) + 4 * i - curOff,
-				sizeof(vals), vals);
+			memcpy(vals, buf + ndpIndex + sizeof(ndp) + 4 * i, sizeof(vals));
 			uint16_t dgIndex = le16_to_cpu(vals[0]);
 			uint16_t dgLen = le16_to_cpu(vals[1]);
 			if (dgIndex == 0 && dgLen == 0) {
 				break;  // End of this NDP.
 			}
-			dgrams[nDgrams].index = dgIndex;
-			dgrams[nDgrams].len = dgLen;
-			nDgrams++;
-		}
-
-		for (uint16_t i = 0; i < nDgrams; i++) {
-			uint16_t dgIndex = dgrams[i].index;
-			uint16_t dgLen = dgrams[i].len;
-			if (dgIndex < curOff || dgLen < 14 ||
-				dgIndex + dgLen > blockLen) {
+			if (dgLen < 14 || dgIndex + dgLen > blockLen) {
 				LOG(V_ERROR, "NCM RX: datagram out of bounds "
-					"(index %d, len %d, cur %d)", dgIndex, dgLen, curOff);
-				ok = false;
-				break;
+					"(index %d, len %d)", dgIndex, dgLen);
+				return;
 			}
-
-			// Discard the region before the datagram (NTH/NDP/padding):
-			if (dgIndex > curOff) {
-				mbuf_t rest = NULL;
-				if (!splitMbuf(m, dgIndex - curOff, &rest)) {
-					LOG(V_ERROR, "NCM RX: mbuf_split (pre) failed");
-					ok = false;
-					break;
-				}
-				freePacket(m);  // NTH/NDP/padding head.
-				m = rest;
-				curOff = dgIndex;
-			}
-
-			// Carve out exactly the datagram:
-			mbuf_t dgram;
-			if ((uint32_t)mbuf_pkthdr_len(m) > (uint32_t)dgLen) {
-				mbuf_t tail = NULL;
-				if (!splitMbuf(m, dgLen, &tail)) {
-					LOG(V_ERROR, "NCM RX: mbuf_split (dgram) failed");
-					ok = false;
-					break;
-				}
-				dgram = m;
-				m = tail;
-			} else {
-				// Datagram fills the rest of the chain:
-				dgram = m;
-				m = NULL;
+			if (!submitClusterPacket(buf + dgIndex, dgLen, slot->lease)) {
+				LOG(V_ERROR, "NCM RX: submitClusterPacket failed");
+				fpNetStats->inputErrors++;
+				return;
 			}
 			LOG(V_PACKET, "submitted pkt sz %d", dgLen);
-			fNetworkInterface->inputPacket(dgram, dgLen);
-			fpNetStats->inputPackets++;
 		}
 		ndpIndex = nextNdp;
-	}
-
-	// Drop whatever could not be consumed:
-	if (m) {
-		freePacket(m);
 	}
 }
 

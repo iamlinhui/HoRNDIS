@@ -49,12 +49,12 @@ configuration:
 | `OUT_BUF_SIZE` | `16384` | TX buffer size. Multiple RNDIS PDUs are packed into one USB transfer (RNDIS data messages carry "1-N packets" per the spec). |
 | `TX_AGGREGATE` | `1` | `1` = aggregate several packets per transfer (timer-flushed); `0` = one transfer per packet (legacy behavior). Set to `0` if a device's RNDIS firmware mishandles multi-PDU messages. |
 | `TX_FLUSH_US` | `1000` | How long a partially-filled TX aggregate waits before being flushed (µs). Lower = less added latency; higher = better small-packet aggregation. |
-| `RX_ZEROCOPY` | `1` | `1` = receive directly into mbuf packets and split PDUs with `mbuf_split` (no per-byte copy); `0` = legacy copy path. If the kext fails to load with a link error mentioning `mbuf_split`, set to `0`. |
+| `RX_ZEROCOPY` | `1` | Received packets are handed to the stack as mbuf clusters referencing the USB receive buffer (`mbuf_attachcluster` + a per-buffer lease refcount) instead of being copied. `0` = legacy copy path. |
 | `N_IN_BUFS` | `2` | Concurrent in-flight RX transfers. `2` wins on USB3 full-duplex links; on a device that still negotiates USB2, `1` may perform better (half-duplex bus contention). |
 | `RNDIS_DYNAMIC_FILTER` | `1` | Keep the device's packet filter minimal (unicast+broadcast), adding multicast-all / promiscuous only while the network stack asks for them. Stops the host from receiving every frame on the tether segment. `0` = legacy always-open filter. |
 | `RNDIS_KEEPALIVE` | `1` | Send `REMOTE_NDIS_KEEPALIVE_MSG` on the control channel every 5 s while the interface is up, per the RNDIS spec (fire-and-forget; the response is drained by the next command). |
 | `RNDIS_CMD_RETRIES` / `RNDIS_CMD_WAIT_US` | `10` / `10000` | Control command patience: up to 10 waits of 10 ms for the device to produce a response. |
-| `TX_ZEROCOPY` | `1` | Build the outbound RNDIS transfer as an mbuf chain (header mbuf + packet chains, concatenated) instead of copying payload bytes. Requires `mbuf_concatenate`; set to `0` (copy-based aggregation) if the kext fails to load with a link error mentioning it. |
+| `TX_ZEROCOPY` | `1` | The outbound RNDIS transfer is an mbuf chain submitted through a scatter-gather descriptor (per-mbuf `withAddress` + `IOMultiMemoryDescriptor`) instead of copying payload bytes. `0` = copy-based aggregation. |
 | `NCM_SUPPORT` | `1` | Additionally implement CDC NCM (Ethernet over USB, NTB16). The protocol is chosen at probe time: a `02/0D/00` control interface picks NCM, the RNDIS personalities keep RNDIS. NCM requires `RX_ZEROCOPY=1`. Set to `0` for a pure RNDIS build. |
 
 ### RNDIS protocol layer

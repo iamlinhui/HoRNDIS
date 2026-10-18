@@ -39,7 +39,9 @@
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
 #include <IOKit/IOBufferMemoryDescriptor.h>
-#include <IOKit/IOMbufMemoryDescriptor.h>
+#if TX_ZEROCOPY
+#include <IOKit/IOMultiMemoryDescriptor.h>
+#endif
 #include <IOKit/IOMessage.h>
 
 #include <IOKit/usb/IOUSBHostFamily.h>
@@ -83,20 +85,17 @@ extern "C"
 // higher = better aggregation for small-packet flows.
 #define TX_FLUSH_US             1000
 
-// RX_ZEROCOPY: receive directly into mbuf packets (IOMbufMemoryDescriptor)
-// and split each RNDIS PDU out with mbuf_split instead of copying every
-// received byte into a fresh mbuf. Requires 'mbuf_split', which is a
-// documented Kernel API. If the kext fails to load with a link error
-// mentioning mbuf_split, set this to 0 to fall back to the copy-based path.
+// RX_ZEROCOPY: received packets are handed to the network stack as mbufs
+// that reference the USB receive buffer directly (mbuf_attachcluster over
+// the IOBufferMemoryDescriptor), instead of copying every byte into a
+// fresh mbuf. Buffer lifetime is managed by a per-buffer lease refcount
+// freed by the mbuf cluster free callback. 0 = copy-based RX.
 #define RX_ZEROCOPY             1
 
-// TX_ZEROCOPY: build the outbound transfer as an mbuf chain (RNDIS header
-// mbuf + packet chains, concatenated) instead of copying every byte into a
-// wired buffer. Requires 'mbuf_concatenate' (documented Kernel API, same
-// family as 'mbuf_split'). If the kext fails to load with a link error
-// mentioning mbuf_concatenate, set this to 0 to fall back to the copy path.
-// NOTE: when RX_ZEROCOPY is 0, the NCM RX path uses the copy fallback as
-// well, but NCM TX always uses the (copy-based) NTB fill buffer.
+// TX_ZEROCOPY: the outbound transfer is built as an mbuf chain (RNDIS
+// header mbuf + packet chains) and submitted through a scatter-gather
+// IOMemoryDescriptor (per-mbuf withAddress + IOMultiMemoryDescriptor)
+// instead of copying payload bytes into a wired buffer. 0 = copy path.
 #define TX_ZEROCOPY             1
 
 // NCM_SUPPORT: additionally implement the CDC Network Control Model
@@ -391,17 +390,30 @@ struct ncm_ntb_parameters {
 
 /***** Actual class definitions *****/
 
+// Zero-copy RX buffer lease: heap-allocated, referenced by every
+// attachclustered mbuf handed to the network stack. When the last cluster
+// is freed, the free callback releases the buffer descriptor and the lease
+// itself, so an outstanding lease outlives even the driver instance.
+struct RxBufLease {
+	IOBufferMemoryDescriptor *mdp;
+	SInt32 count;        // Outstanding clusters (atomic).
+	bool freeWhenDone;   // Set at teardown: free on the last release.
+};
+
 typedef struct {
 	// Descriptor handed to 'pipe->io': either kind below.
 	IOMemoryDescriptor *dmaBuf;
 	// TX (and legacy copy-based RX): contiguous wired buffer.
 	IOBufferMemoryDescriptor *mdp;
+	// Zero-copy RX: the lease owning 'mdp' (NULL in copy mode).
+	RxBufLease *lease;
+	// True while a transfer is outstanding on this slot.
+	bool inFlight;
 	// The pipe this buffer is submitted on (RX slots; TX slots always use
 	// the first OUT pipe for RNDIS, alternating pipes for NCM).
 	IOUSBHostPipe *pipe;
-#if RX_ZEROCOPY || TX_ZEROCOPY
-	// Zero-copy paths: descriptor over the mbuf packet + the packet itself.
-	IOMbufMemoryDescriptor *mbufMdp;
+#if TX_ZEROCOPY
+	// Zero-copy TX: the in-flight aggregate chain (freed on completion).
 	mbuf_t m;
 #endif
 	IOUSBHostCompletion comp;
@@ -579,8 +591,11 @@ private:
 	void armTxFlushTimer(void);
 	bool startRead(pipebuf_t *inbuf);
 	void releaseReadBuffer(pipebuf_t *inbuf);
-#if RX_ZEROCOPY
-	void receivePacketZeroCopy(mbuf_t m, UInt32 size);
+#if RX_ZEROCOPY || NCM_SUPPORT
+	// (NCM requires RX_ZEROCOPY, so these are compiled together.)
+	static void rxClusterFreed(caddr_t extbuf, u_int extsize, caddr_t extarg);
+	void receivePacketZeroCopy(pipebuf_t *slot, UInt32 size);
+	bool submitClusterPacket(uint8_t *data, UInt32 len, RxBufLease *lease);
 #endif
 
 	// RNDIS protocol layer:
@@ -599,7 +614,7 @@ private:
 	bool ncmSetPacketFilter(uint32_t filter);
 	bool ncmAppendPacket(mbuf_t packet, size_t pktlen);
 	void ncmFlushNtb(void);
-	void ncmReceivePacket(mbuf_t m, UInt32 size);
+	void ncmReceivePacket(pipebuf_t *slot, UInt32 size);
 	void ncmHandleNotification(const void *data, UInt32 len);
 	void ncmFallbackMAC(void);
 #endif
