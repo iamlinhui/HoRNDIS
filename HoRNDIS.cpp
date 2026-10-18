@@ -2334,6 +2334,29 @@ void HoRNDIS::receivePacketZeroCopy(pipebuf_t *slot, UInt32 size) {
 /***** RNDIS command logic *****/
 
 IOReturn HoRNDIS::rndisCommand(struct rndis_msg_hdr *buf, int buflen) {
+	// The implementation below sleeps with 'commandSleep', which requires
+	// the command gate to be held. Callers like 'start' (device matching)
+	// and possibly the network stack's 'getHardwareAddress' do NOT hold
+	// it, so route the whole command through 'runAction': it blocks until
+	// the gate is available, then runs the action WITH the gate held.
+	// When the caller already owns the gate (enable/disable paths),
+	// runAction executes the action inline without blocking.
+	if (!getCommandGate()) {
+		LOG(V_ERROR, "rndisCommand: no command gate available");
+		return kIOReturnError;
+	}
+	return getCommandGate()->runAction(
+		&HoRNDIS::rndisCommandGated, buf, (void *)(uintptr_t)buflen);
+}
+
+IOReturn HoRNDIS::rndisCommandGated(OSObject *owner, void *bufArg,
+	void *buflenArg, void *unused0, void *unused1) {
+	HoRNDIS *me = (HoRNDIS *)owner;
+	return me->rndisCommandImpl((struct rndis_msg_hdr *)bufArg,
+		(int)(uintptr_t)buflenArg);
+}
+
+IOReturn HoRNDIS::rndisCommandImpl(struct rndis_msg_hdr *buf, int buflen) {
 	IOReturn rc = kIOReturnSuccess;
 	if (!fCommInterface) {  // Safety: make sure 'fCommInterface' is valid.
 		LOG(V_ERROR, "fCommInterface is NULL, bailing out");

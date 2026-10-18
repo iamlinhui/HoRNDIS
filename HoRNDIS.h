@@ -619,7 +619,14 @@ private:
 #endif
 
 	bool rndisInit();
+	// 'rndisCommand' wraps the implementation in
+	// 'getCommandGate()->runAction': the implementation sleeps with
+	// 'commandSleep', which REQUIRES the gate to be held, but callers like
+	// 'start' (device matching) do not hold it.
 	IOReturn rndisCommand(struct rndis_msg_hdr *buf, int buflen);
+	static IOReturn rndisCommandGated(OSObject *owner, void *bufArg,
+		void *buflenArg, void *unused0, void *unused1);
+	IOReturn rndisCommandImpl(struct rndis_msg_hdr *buf, int buflen);
 	int rndisQuery(void *buf, uint32_t oid, uint32_t in_len, void **reply, int *reply_len);
 	bool rndisSetPacketFilter(uint32_t filter);
 

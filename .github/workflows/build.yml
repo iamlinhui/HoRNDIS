@@ -1,6 +1,11 @@
 # Builds the kext on macOS CI so that every push gets a compile check
-# without needing a local Mac. Two runners cover both architectures:
-#   macos-13 = Intel (x86_64),  macos-14 = Apple Silicon (arm64).
+# without needing a local Mac.
+#
+# A single arm64 runner (macos-14) is enough: with ONLY_ACTIVE_ARCH=NO the
+# build is universal (x86_64 + arm64e slices in one kext), so the artifact
+# works on both Intel and Apple Silicon Macs. (macos-13 Intel runners are
+# being retired by GitHub and sit in the queue for hours; they add no
+# coverage since x86_64 is cross-compiled on macos-14 anyway.)
 #
 # NOTE: GitHub-hosted macOS runners run with SIP enabled, so the kext
 # cannot be *loaded* here - this pipeline verifies that it BUILDS and
@@ -16,12 +21,8 @@ on:
 
 jobs:
   build-kext:
-    name: Build (${{ matrix.runner }})
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [macos-13, macos-14]
-    runs-on: ${{ matrix.runner }}
+    name: Build (macos-14, universal)
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
 
@@ -55,6 +56,6 @@ jobs:
       - name: Upload the kext artifact
         uses: actions/upload-artifact@v4
         with:
-          name: HoRNDIS-${{ matrix.runner }}
+          name: HoRNDIS-kext
           path: HoRNDIS.kext
           if-no-files-found: error
