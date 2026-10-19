@@ -37,6 +37,29 @@ jobs:
             MACOSX_DEPLOYMENT_TARGET=10.13 \
             build
 
+      - name: Build the kext (Debug, verbose packet logs)
+        run: |
+          xcodebuild -project HoRNDIS.xcodeproj \
+            -target HoRNDIS \
+            -configuration Debug \
+            CODE_SIGNING_ALLOWED=NO \
+            ONLY_ACTIVE_ARCH=NO \
+            SDKROOT=macosx \
+            MACOSX_DEPLOYMENT_TARGET=10.13 \
+            build
+
+      - name: Stage the debug kext
+        run: |
+          rm -rf HoRNDIS-debug.kext
+          cp -R build/Debug/HoRNDIS.kext HoRNDIS-debug.kext
+
+      - name: Upload the debug kext artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: HoRNDIS-kext-debug
+          path: HoRNDIS-debug.kext
+          if-no-files-found: error
+
       - name: Verify the product
         run: |
           ls -la build/Release/HoRNDIS.kext

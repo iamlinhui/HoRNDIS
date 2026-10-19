@@ -583,6 +583,12 @@ private:
 	// RX zero-copy: a read could not be re-armed because 'allocatePacket'
 	// failed; the flush timer retries until a buffer becomes available.
 	bool fNeedReadRestart;
+	// RX reader recovery: consecutive submit failures + the retry interval
+	// (exponential backoff). Transient USB errors (device suspend, stalls)
+	// must not kill the interface - only sustained failure reports link
+	// down.
+	int fRxFailCount;
+	uint32_t fRxRetryUs;
 
 	void callbackExit();
 	static void dataWriteComplete(void *obj, void *param, IOReturn ior, UInt32 transferred);
@@ -593,7 +599,7 @@ private:
 
 	bool grabFillBuffer(void);
 	bool submitFillBuffer(void);
-	void armTxFlushTimer(void);
+	void armTxFlushTimer(uint32_t us = TX_FLUSH_US);
 	bool startRead(pipebuf_t *inbuf);
 	void releaseReadBuffer(pipebuf_t *inbuf);
 #if RX_ZEROCOPY || NCM_SUPPORT

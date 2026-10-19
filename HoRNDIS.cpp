@@ -283,6 +283,8 @@ bool HoRNDIS::init(OSDictionary *properties) {
 	fTxFillOffset = 0;
 	fTxFlushTimer = NULL;
 	fTxTimerArmed = false;
+	fRxFailCount = 0;
+	fRxRetryUs = TX_FLUSH_US;
 #if TX_ZEROCOPY
 	fTxHead = NULL;
 	fTxBytes = 0;
@@ -1310,6 +1312,8 @@ bool HoRNDIS::allocateResources() {
 	fTxFillBufIdx = -1;
 	fTxFillOffset = 0;
 	fTxTimerArmed = false;
+	fRxFailCount = 0;
+	fRxRetryUs = TX_FLUSH_US;
 #if TX_ZEROCOPY
 	fTxHead = NULL;
 	fTxBytes = 0;
@@ -1791,12 +1795,12 @@ bool HoRNDIS::submitFillBuffer() {
 	return true;
 }
 
-void HoRNDIS::armTxFlushTimer() {
+void HoRNDIS::armTxFlushTimer(uint32_t us) {
 	if (fTxTimerArmed || !fTxFlushTimer) {
 		return;
 	}
 	fTxTimerArmed = true;
-	fTxFlushTimer->setTimeoutUS(TX_FLUSH_US);
+	fTxFlushTimer->setTimeoutUS(us);
 }
 
 void HoRNDIS::txFlushTimerFired(OSObject *owner, IOTimerEventSource *timer) {
@@ -1826,22 +1830,24 @@ void HoRNDIS::txFlushTimerFired(OSObject *owner, IOTimerEventSource *timer) {
 	}
 #endif
 
-#if RX_ZEROCOPY
-	// RX: retry reads that could not be re-armed (all slots busy or their
-	// buffers still referenced by the network stack). 'startRead' guards
-	// slot readiness itself.
+	// RX: retry reads that could not be re-armed (transient failures or
+	// all slots busy). 'startRead' guards slot readiness itself. This
+	// works in both copy and zero-copy modes.
 	if (me->fNeedReadRestart) {
 		me->fNeedReadRestart = false;
 		for (int i = 0; i < N_IN_BUFS; i++) {
-			if (!me->startRead(&me->inbufs[i])) {
+			if (me->startRead(&me->inbufs[i])) {
+				// A successful restart means the reader is healthy:
+				me->fRxFailCount = 0;
+				me->fRxRetryUs = TX_FLUSH_US;
+			} else {
 				me->fNeedReadRestart = true;
 			}
 		}
 		if (me->fNeedReadRestart) {
-			me->armTxFlushTimer();
+			me->armTxFlushTimer(me->fRxRetryUs);
 		}
 	}
-#endif
 }
 
 // Allocate an RX buffer and submit a read on it. On success the callback
@@ -1875,6 +1881,9 @@ bool HoRNDIS::startRead(pipebuf_t *inbuf) {
 	}
 	inbuf->inFlight = true;
 	fCallbackCount++;
+	// A successful (re)submit means the reader is healthy again:
+	fRxFailCount = 0;
+	fRxRetryUs = TX_FLUSH_US;
 	return true;
 }
 
@@ -2214,9 +2223,22 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 	LOG(V_ERROR, "READER STOPPED: USB failure trying to read: %08x", ior);
 	me->callbackExit();
 	me->fDataDead = true;
-	// The data channel is dead while the device may still be attached:
-	// report link down so the network stack can fail over.
-	me->setLinkStatus(kIONetworkLinkValid, 0);
+	// Transient USB errors (device suspend, lock-screen power saving,
+	// pipe stalls) must NOT kill the interface: retry the reader with
+	// exponential backoff, and only report link down after sustained
+	// failure (~1 minute). The original driver simply stopped reading
+	// here, which is why it "survived" these events.
+	me->fRxFailCount++;
+	if (me->fRxFailCount < 60) {
+		if (me->fRxRetryUs < 1000000) {
+			me->fRxRetryUs *= 2;
+		}
+		me->fNeedReadRestart = true;
+		me->armTxFlushTimer(me->fRxRetryUs);
+	} else {
+		// Sustained failure: report link down so the stack can fail over.
+		me->setLinkStatus(kIONetworkLinkValid, 0);
+	}
 #endif
 }
 
@@ -2603,10 +2625,11 @@ void HoRNDIS::handleIndication(uint32_t status) {
 				getCurrentMedium());
 		}
 	} else if (status == le32_to_cpu(RNDIS_STATUS_MEDIA_DISCONNECT)) {
-		LOG(V_NOTE, "Media disconnect indication");
-		if (fNetifEnabled) {
-			setLinkStatus(kIONetworkLinkValid, 0);
-		}
+		// Android phones send this on lock-screen / USB suspend. Do NOT
+		// tear the interface down: the data-path recovery logic above
+		// decides link state based on actual transfer health instead.
+		LOG(V_NOTE, "Media disconnect indication (ignored; link state "
+			"follows data-path health)");
 	} else {
 		LOG(V_DEBUG, "RNDIS indication, status %08x", status);
 	}
