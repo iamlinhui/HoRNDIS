@@ -89,13 +89,19 @@ extern "C"
 // the IOBufferMemoryDescriptor), instead of copying every byte into a
 // fresh mbuf. Buffer lifetime is managed by a per-buffer lease refcount
 // freed by the mbuf cluster free callback. 0 = copy-based RX.
-#define RX_ZEROCOPY             1
+//
+// TEMPORARILY 0: bisecting a hardware compatibility issue - the copy
+// paths match the proven upstream data plane. Re-enable after the copy
+// build is verified on hardware.
+#define RX_ZEROCOPY             0
 
 // TX_ZEROCOPY: the outbound transfer is built as an mbuf chain (RNDIS
 // header mbuf + packet chains) and submitted through a scatter-gather
 // IOMemoryDescriptor (per-mbuf withAddress + IOMultiMemoryDescriptor)
 // instead of copying payload bytes into a wired buffer. 0 = copy path.
-#define TX_ZEROCOPY             1
+//
+// TEMPORARILY 0: same bisection as RX_ZEROCOPY above.
+#define TX_ZEROCOPY             0
 
 // NCM_SUPPORT: additionally implement the CDC Network Control Model
 // (Ethernet over USB, NTB16) protocol alongside RNDIS. The protocol is

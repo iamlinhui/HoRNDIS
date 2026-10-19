@@ -1599,28 +1599,29 @@ void HoRNDIS::rxClusterFreed(caddr_t extbuf, u_int extsize, caddr_t extarg) {
 	}
 }
 
-// Hand a region of a zero-copy RX buffer to the network stack: a
-// packet-header mbuf plus an attachclustered data mbuf referencing the
-// region - no data copy. Returns false on allocation failure (the lease
-// count is NOT incremented in that case).
+// Hand a region of a zero-copy RX buffer to the network stack: one mbuf
+// with a packet header whose external cluster references the region - no
+// data copy, and the Ethernet header sits at the start of the packet data
+// exactly like a copied packet would.
 bool HoRNDIS::submitClusterPacket(uint8_t *data, UInt32 len,
 	RxBufLease *lease) {
 	// Completion context: blocking allocation is fine (thread context).
-	mbuf_t hdrM = NULL;
-	if (mbuf_gethdr(MBUF_WAITOK, MBUF_TYPE_DATA, &hdrM) != 0) {
+	mbuf_t m = NULL;
+	if (mbuf_gethdr(MBUF_WAITOK, MBUF_TYPE_DATA, &m) != 0) {
 		return false;
 	}
-	mbuf_t dataM = NULL;
-	if (mbuf_attachcluster(MBUF_WAITOK, MBUF_TYPE_DATA, &dataM,
+	// Attach the external cluster DIRECTLY to this packet-header mbuf
+	// (mbuf_attachcluster supports a caller-supplied mbuf): the result is
+	// a single mbuf, M_PKTHDR|M_EXT, whose data starts at the frame bytes.
+	if (mbuf_attachcluster(MBUF_WAITOK, MBUF_TYPE_DATA, &m,
 			(caddr_t)data, &HoRNDIS::rxClusterFreed, len,
 			(caddr_t)lease) != 0) {
-		freePacket(hdrM);
+		freePacket(m);
 		return false;
 	}
 	OSIncrementAtomic(&lease->count);
-	mbuf_concatenate(hdrM, dataM);
-	mbuf_pkthdr_setlen(hdrM, len);
-	fNetworkInterface->inputPacket(hdrM, len);
+	mbuf_pkthdr_setlen(m, len);
+	fNetworkInterface->inputPacket(m, len);
 	fpNetStats->inputPackets++;
 	return true;
 }
