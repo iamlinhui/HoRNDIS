@@ -697,6 +697,15 @@ IOService *HoRNDIS::probe(IOService *provider, SInt32 *score) {
 	bool ncm = false;
 #if NCM_SUPPORT
 	ncm = isNCMControlInterface(desc);
+#if !RX_ZEROCOPY
+	if (ncm) {
+		// NCM requires RX_ZEROCOPY (see 'ncmInit'). Without it, do NOT
+		// claim the device: a failed 'start' would block the system's
+		// built-in CDC NCM driver from taking over.
+		LOG(V_NOTE, "NCM interface ignored: built without RX_ZEROCOPY");
+		return NULL;
+	}
+#endif
 #endif
 	if (!ncm && !isRNDISControlInterface(desc)) {
 		LOG(V_ERROR, "not an RNDIS/NCM control interface (wrong Info.plist)");
@@ -765,7 +774,7 @@ IOService *HoRNDIS::probeDevice(IOUSBHostDevice *device, SInt32 *score) {
 			// If this is a device-level match, check for the control
 			// interface (either protocol; the data number comes from the
 			// Union descriptor for NCM, control+1 for RNDIS):
-#if NCM_SUPPORT
+#if NCM_SUPPORT && RX_ZEROCOPY
 			if (isNCMControlInterface(intDesc)) {
 				int dnum = getUnionDataIfNum(intDesc);
 				if (dnum >= 0) {
@@ -2184,7 +2193,8 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 	me->callbackExit();
 #else
 	inbuf->inFlight = false;
-	inbuf->dmaBuf = NULL;
+	// NOTE: do NOT clear 'dmaBuf' here - the re-arm below submits through
+	// it ('robustIO' uses 'buf->dmaBuf'), and it still points at 'mdp'.
 	if (rc == kIOReturnSuccess) {
 		// Got one?  Hand it to the back end.
 		LOG(V_PACKET, "Reader(%ld), tid=%lld: %d bytes", inbuf - me->inbufs,
