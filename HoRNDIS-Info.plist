@@ -69,21 +69,6 @@
 			<key>bInterfaceProtocol</key>
 			<integer>255</integer>
 		</dict>
-		<key>NCMControlInterface</key>
-		<dict>
-			<key>CFBundleIdentifier</key>
-			<string>com.joshuawise.kexts.HoRNDIS</string>
-			<key>IOClass</key>
-			<string>HoRNDIS</string>
-			<key>IOProviderClass</key>
-			<string>IOUSBHostInterface</string>
-			<key>bInterfaceClass</key>
-			<integer>2</integer>
-			<key>bInterfaceSubClass</key>
-			<integer>13</integer>
-			<key>bInterfaceProtocol</key>
-			<integer>0</integer>
-		</dict>
 		<key>WirelessControllerDevice</key>
 		<dict>
 			<key>CFBundleIdentifier</key>

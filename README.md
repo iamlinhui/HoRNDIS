@@ -57,13 +57,12 @@ configuration:
 | `OUT_BUF_SIZE` | `16384` | TX buffer size. Multiple RNDIS PDUs are packed into one USB transfer (RNDIS data messages carry "1-N packets" per the spec). |
 | `TX_AGGREGATE` | `1` | `1` = aggregate several packets per transfer (timer-flushed); `0` = one transfer per packet (legacy behavior). Set to `0` if a device's RNDIS firmware mishandles multi-PDU messages. |
 | `TX_FLUSH_US` | `1000` | How long a partially-filled TX aggregate waits before being flushed (µs). Lower = less added latency; higher = better small-packet aggregation. |
-| `RX_ZEROCOPY` | `0` | `0` uses the copy-based RX path. `1` uses mbuf clusters referencing USB receive buffers; this experimental path needs hardware validation. NCM is not claimed with the default `0`. |
+| `RX_ZEROCOPY` | `0` | `0` uses the copy-based RX path. `1` uses mbuf clusters referencing USB receive buffers; this experimental path needs hardware validation. |
 | `N_IN_BUFS` | `2` | Concurrent in-flight RX transfers. `2` wins on USB3 full-duplex links; on a device that still negotiates USB2, `1` may perform better (half-duplex bus contention). |
 | `RNDIS_DYNAMIC_FILTER` | `1` | Keep the device's packet filter minimal (unicast+broadcast), adding multicast-all / promiscuous only while the network stack asks for them. Stops the host from receiving every frame on the tether segment. `0` = legacy always-open filter. |
 | `RNDIS_KEEPALIVE` | `0` | Disabled: the legacy fire-and-forget implementation does not consume responses promptly. A response-aware implementation is needed before enabling it. |
 | `RNDIS_CMD_RETRIES` / `RNDIS_CMD_WAIT_US` | `10` / `10000` | Control command patience: up to 10 waits of 10 ms for the device to produce a response. |
 | `TX_ZEROCOPY` | `0` | `0` uses copy-based transmission. `1` uses scatter-gather descriptors and is experimental; validate it on the target device before use. |
-| `NCM_SUPPORT` | `1` | Additionally implement CDC NCM (Ethernet over USB, NTB16). The protocol is chosen at probe time: a `02/0D/00` control interface picks NCM, the RNDIS personalities keep RNDIS. NCM requires `RX_ZEROCOPY=1`. Set to `0` for a pure RNDIS build. |
 
 ### RNDIS protocol layer
 
@@ -88,40 +87,7 @@ TX zero-copy remain disabled pending hardware validation. The network medium
 currently reports 5 Gb/s for any SuperSpeed link, including 10 Gb/s links; use
 System Information → USB to check the actual USB connection speed.
 
-### CDC NCM support
-
-The NCM implementation is compiled with `NCM_SUPPORT=1`, but the current
-default `RX_ZEROCOPY=0` deliberately declines NCM interfaces. Enabling
-`RX_ZEROCOPY=1` enables NCM matching; that experimental configuration still
-requires device and lifetime testing. When enabled, probe selects the protocol:
-
-- A control interface with class/subclass/protocol `02/0D/00` (CDC Network
-  Control Model) selects **NCM**; the data interface is located via the CDC
-  Union functional descriptor.
-- Any interface matching the RNDIS personalities (`224/1/3`, `239/4/1`,
-  `2/2/255`) keeps the **RNDIS** path.
-
-The NCM layer follows Linux `cdc_ncm.c`: NTB16 format, `GET_NTB_PARAMETERS`
-negotiation (sizes clamped to 2K-64K), `SET_NTB_INPUT_SIZE` before RX, NDP
-table parsing with zero-copy cluster extraction, TX NTB aggregation
-with the device's datagram alignment rules, and CDC `NETWORK_CONNECTION`
-notifications driving the link state. If the data interface exposes **two
-bulk endpoint pairs**, both are used (concurrent RX reads, alternating TX
-submits). NCM requires `RX_ZEROCOPY=1`. Devices requiring a non-default
-alternate setting for their bulk endpoints are not yet supported by this path.
-
-For a module like the TD Tech MT5700M-CN:
-
-```sh
-# NCM (recommended by the module vendor):
-AT^SETMODE=4          # Linux NCM Normal (the factory default)
-AT^SETAUTODIAL=1,1    # auto-dial over USB 3.0
-# RNDIS (fallback):
-AT^SETMODE=6          # Windows RNDIS
-```
-
-Verify in the kernel log: `Matched a NCM control interface`, the
-`NCM: rxMax=... txMax=...` parameter dump, and `submitted pkt sz` lines.
+This driver supports RNDIS interfaces only; it does not claim CDC-NCM devices.
 
 ### Verifying a build
 

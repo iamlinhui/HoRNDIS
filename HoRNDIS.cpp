@@ -177,15 +177,6 @@ static inline bool isCDCDataInterface(const InterfaceDescriptor *idesc) {
 	return idesc->bInterfaceClass == 10;
 }
 
-#if NCM_SUPPORT
-// Detects the 2/0x0D/0 - CDC NCM control interface.
-static inline bool isNCMControlInterface(const InterfaceDescriptor *idesc) {
-	return idesc->bInterfaceClass == NCM_IF_CLASS
-		&& idesc->bInterfaceSubClass == NCM_IF_SUBCLASS
-		&& idesc->bInterfaceProtocol == 0;
-}
-
-#endif
 
 // Parse the CDC Union functional descriptor from a control interface's
 // extra descriptor bytes; returns the subordinate (data) interface number,
@@ -231,11 +222,11 @@ bool HoRNDIS::init(OSDictionary *properties) {
 	fNetifEnabled = false;
 	fEnableDisableInProgress = false;
 	fDataDead = false;
+	fRxLinkDown = false;
 
 	fProbeConfigVal = 0;
 	fProbeCommIfNum = 0;
 	fProbeDataIfNum = 0;
-	fProtocol = kProtocolRNDIS;
 
 	fCallbackCount = 0;
 
@@ -244,9 +235,6 @@ bool HoRNDIS::init(OSDictionary *properties) {
 	
 	fInPipe = NULL;
 	fOutPipe = NULL;
-	fInPipe2 = NULL;
-	fOutPipe2 = NULL;
-	fTxOutPipeToggle = false;
 	fIntPipe = NULL;
 	fIntBuf.mdp = NULL;
 	fIntBuf.dmaBuf = NULL;
@@ -289,24 +277,13 @@ bool HoRNDIS::init(OSDictionary *properties) {
 	fTxFillOffset = 0;
 	fTxFlushTimer = NULL;
 	fTxTimerArmed = false;
+	fRxRetryTimer = NULL;
+	fRxTimerArmed = false;
 	fRxFailCount = 0;
 	fRxRetryUs = TX_FLUSH_US;
 #if TX_ZEROCOPY
 	fTxHead = NULL;
 	fTxBytes = 0;
-#endif
-#if NCM_SUPPORT
-	fNcmRxMax = 0;
-	fNcmTxMax = 0;
-	fNcmNdpAlign = NCM_NDP_ALIGN_MIN;
-	fNcmModulus = NCM_NDP_ALIGN_MIN;
-	fNcmRemainder = 0;
-	fNcmMaxDatagrams = 0;
-	fNcmMaxNdpSize = 0;
-	fNcmSeq = 0;
-	fNcmMaxDatagram = NCM_MIN_DATAGRAM_SIZE;
-	fTxNdpOffset = 0;
-	fTxNdpCount = 0;
 #endif
 	fNeedReadRestart = false;
 
@@ -378,8 +355,6 @@ bool HoRNDIS::start(IOService *provider) {
 	}
 
 	{  // TX flush timer: fires partially-filled aggregated transfers.
-		// Also used as the RX re-arm retry tick when an 'allocatePacket'
-		// fails (see 'txFlushTimerFired').
 		fTxFlushTimer = IOTimerEventSource::timerEventSource(
 			this, &HoRNDIS::txFlushTimerFired);
 		if (!fTxFlushTimer ||
@@ -388,6 +363,17 @@ bool HoRNDIS::start(IOService *provider) {
 			goto bailout;
 		}
 		fTxFlushTimer->enable();
+	}
+
+	{  // RX retry timer: independent of the TX flush deadline.
+		fRxRetryTimer = IOTimerEventSource::timerEventSource(
+			this, &HoRNDIS::rxRetryTimerFired);
+		if (!fRxRetryTimer ||
+			getWorkLoop()->addEventSource(fRxRetryTimer) != kIOReturnSuccess) {
+			LOG(V_ERROR, "Cannot create the RX retry timer");
+			goto bailout;
+		}
+		fRxRetryTimer->enable();
 	}
 
 	{  // Control-channel timer: keep-alive ticks and command-wait timeouts.
@@ -413,16 +399,7 @@ bool HoRNDIS::start(IOService *provider) {
 		goto bailout;
 	}
 
-	if (fProtocol == kProtocolNCM) {
-#if NCM_SUPPORT
-		if (!ncmInit()) {
-			goto bailout;
-		}
-#else
-		LOG(V_ERROR, "Matched NCM but the driver was built without NCM support");
-		goto bailout;
-#endif
-	} else if (!rndisInit()) {
+	if (!rndisInit()) {
 		goto bailout;
 	}
 
@@ -492,6 +469,15 @@ void HoRNDIS::stop(IOService *provider) {
 		fTxFlushTimer = NULL;
 	}
 	fTxTimerArmed = false;
+
+	if (fRxRetryTimer) {
+		fRxRetryTimer->cancelTimeout();
+		fRxRetryTimer->disable();
+		getWorkLoop()->removeEventSource(fRxRetryTimer);
+		fRxRetryTimer->release();
+		fRxRetryTimer = NULL;
+	}
+	fRxTimerArmed = false;
 
 	if (fCtrlTimer) {
 		fCtrlTimer->cancelTimeout();
@@ -605,9 +591,7 @@ bool HoRNDIS::openUSBInterfaces(IOService *provider) {
 		return false;
 	}
 	
-	{  // Get the pipes for the data interface. NCM data interfaces may
-		// expose two bulk pairs ("two endpoints"); we collect up to two
-		// per direction. RNDIS devices have a single pair.
+	{  // Get the first bulk pipe in each direction for the data interface.
 		const EndpointDescriptor *candidate = NULL;
 		const InterfaceDescriptor *intDesc = fDataInterface->getInterfaceDescriptor();
 		const ConfigurationDescriptor *confDesc = fDataInterface->getConfigurationDescriptor();
@@ -625,20 +609,14 @@ bool HoRNDIS::openUSBInterfaces(IOService *provider) {
 			const bool isEPIn =
 				(candidate->bEndpointAddress & kEndpointDescriptorDirection) != 0;
 			IOUSBHostPipe *&pipe1 = isEPIn ? fInPipe : fOutPipe;
-			IOUSBHostPipe *&pipe2 = isEPIn ? fInPipe2 : fOutPipe2;
 			if (pipe1 == NULL) {
 				// Note, 'copyPipe' already performs 'retain'.
 				pipe1 = fDataInterface->copyPipe(candidate->bEndpointAddress);
-			} else if (pipe2 == NULL) {
-				pipe2 = fDataInterface->copyPipe(candidate->bEndpointAddress);
 			}
 		}
 		if (fInPipe == NULL || fOutPipe == NULL) {
 			LOG(V_ERROR, "Could not init IN/OUT pipes in the Data Interface");
 			return false;
-		}
-		if (fInPipe2 || fOutPipe2) {
-			LOG(V_NOTE, "Data interface has two bulk pairs; using both");
 		}
 	}
 
@@ -680,8 +658,6 @@ void HoRNDIS::closeUSBInterfaces() {
 
 	OSSafeReleaseNULL(fInPipe);
 	OSSafeReleaseNULL(fOutPipe);
-	OSSafeReleaseNULL(fInPipe2);
-	OSSafeReleaseNULL(fOutPipe2);
 	OSSafeReleaseNULL(fIntPipe);
 	OSSafeReleaseNULL(fDataInterface);
 	OSSafeReleaseNULL(fCommInterface);  // First one to open, last one to die.
@@ -708,40 +684,16 @@ IOService *HoRNDIS::probe(IOService *provider, SInt32 *score) {
 		desc->bInterfaceClass, desc->bInterfaceSubClass,
 		desc->bInterfaceProtocol);
 
-	bool ncm = false;
-#if NCM_SUPPORT
-	ncm = isNCMControlInterface(desc);
-#if !RX_ZEROCOPY
-	if (ncm) {
-		// NCM requires RX_ZEROCOPY (see 'ncmInit'). Without it, do NOT
-		// claim the device: a failed 'start' would block the system's
-		// built-in CDC NCM driver from taking over.
-		LOG(V_NOTE, "NCM interface ignored: built without RX_ZEROCOPY");
-		return NULL;
-	}
-#endif
-#endif
-	if (!ncm && !isRNDISControlInterface(desc)) {
-		LOG(V_ERROR, "not an RNDIS/NCM control interface (wrong Info.plist)");
+	if (!isRNDISControlInterface(desc)) {
+		LOG(V_ERROR, "not an RNDIS control interface (wrong Info.plist)");
 		return NULL;
 	}
 
 	const ConfigurationDescriptor *configDesc =
 		controlIf->getConfigurationDescriptor();
 
-	// The data interface number: explicit from the Union descriptor for
-	// NCM, implicitly control+1 for RNDIS:
+	// Use the Union descriptor when present, otherwise control+1:
 	uint8_t dataIfNum;
-#if NCM_SUPPORT
-	if (ncm) {
-		int dnum = getUnionDataIfNum(configDesc, desc);
-		if (dnum < 0) {
-			LOG(V_DEBUG, "NCM control interface without a Union descriptor");
-			return NULL;
-		}
-		dataIfNum = (uint8_t)dnum;
-	} else
-#endif
 	{
 		int dnum = getUnionDataIfNum(configDesc, desc);
 		if (dnum < 0 && desc->bInterfaceNumber == 255) return NULL;
@@ -764,10 +716,7 @@ IOService *HoRNDIS::probe(IOService *provider, SInt32 *score) {
 	fProbeConfigVal = configDesc->bConfigurationValue;
 	fProbeCommIfNum = desc->bInterfaceNumber;
 	fProbeDataIfNum = dataIfNum;
-#if NCM_SUPPORT
-	fProtocol = ncm ? kProtocolNCM : kProtocolRNDIS;
-#endif
-	LOG(V_NOTE, "Matched a %s control interface", ncm ? "NCM" : "RNDIS");
+	LOG(V_NOTE, "Matched a RNDIS control interface");
 	*score += 100000;
 	return this;
 }
@@ -787,30 +736,14 @@ IOService *HoRNDIS::probeDevice(IOUSBHostDevice *device, SInt32 *score) {
 		}
 		int controlIfNum = -1;
 		int dataIfNum = -1;
-		int proto = -1;
 		bool foundData = false;
 		const InterfaceDescriptor *intDesc = NULL;
 		while((intDesc = StandardUSB::getNextInterfaceDescriptor(configDesc, intDesc)) != NULL) {
-			// If this is a device-level match, check for the control
-			// interface (either protocol; the data number comes from the
-			// Union descriptor for NCM, control+1 for RNDIS):
-#if NCM_SUPPORT && RX_ZEROCOPY
-			if (isNCMControlInterface(intDesc)) {
-				int dnum = getUnionDataIfNum(configDesc, intDesc);
-				if (dnum >= 0) {
-					controlIfNum = intDesc->bInterfaceNumber;
-					dataIfNum = dnum;
-					proto = kProtocolNCM;
-				} else {
-					continue;
-				}
-			} else
-#endif
+			// Find an RNDIS control interface and its data interface:
 			if (isRNDISControlInterface(intDesc)) {
 				controlIfNum = intDesc->bInterfaceNumber;
 				dataIfNum = getUnionDataIfNum(configDesc, intDesc);
 				if (dataIfNum < 0) dataIfNum = controlIfNum + 1;
-				proto = kProtocolRNDIS;
 			} else {
 				continue;
 			}
@@ -828,9 +761,6 @@ IOService *HoRNDIS::probeDevice(IOUSBHostDevice *device, SInt32 *score) {
 			fProbeConfigVal = configDesc->bConfigurationValue;
 			fProbeCommIfNum = (uint8_t)controlIfNum;
 			fProbeDataIfNum = (uint8_t)dataIfNum;
-#if NCM_SUPPORT
-			fProtocol = (proto == kProtocolNCM) ? kProtocolNCM : kProtocolRNDIS;
-#endif
 			*score += 10000;
 			return this;
 		}
@@ -883,12 +813,6 @@ IONetworkInterface *HoRNDIS::createInterface() {
 	}
 
 	int mtuLimit;
-#if NCM_SUPPORT
-	if (fProtocol == kProtocolNCM) {
-		// NCM: bounded by the negotiated max datagram size:
-		mtuLimit = (int)fNcmMaxDatagram - 14;
-	} else
-#endif
 	{
 		mtuLimit = maxOutTransferSize
 			- (int)sizeof(rndis_data_hdr)
@@ -1009,12 +933,8 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 		return kIOReturnNoMemory;
 	}
 
-	// Tell the other end to start transmitting. The packet filter starts
-	// minimal (unicast + broadcast) and grows as the network stack asks
-	// for multicast/promiscuous reception.
+	// Apply the cached multicast/promiscuous requests on each enable.
 	fCurrentFilter = 0;
-	fMulticastEnabled = false;
-	fPromiscEnabled = false;
 	if (!updatePacketFilter()) {
 		rtn = kIOReturnError;
 		goto bailout;
@@ -1028,18 +948,16 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 	loopClearPipeStall(fInPipe);
 	loopClearPipeStall(fOutPipe);
 
+	// A new enable is the only way to clear a terminal RX stop.
+	fDataDead = false;
+	fRxLinkDown = false;
 	// We can now perform reads and writes between Network stack and USB device:
 	fReadyToTransfer = true;
 
-	// Assign each RX slot its pipe (NCM with two bulk pairs uses both):
+	// Assign each RX slot its input pipe:
 	for (int i = 0; i < N_IN_BUFS; i++) {
 		inbufs[i].pipe = fInPipe;
 	}
-#if NCM_SUPPORT
-	if (fProtocol == kProtocolNCM && fInPipe2 && N_IN_BUFS >= 2) {
-		inbufs[1].pipe = fInPipe2;
-	}
-#endif
 	
 	// Kick off the read requests ('startRead' guards slot readiness: a
 	// slot whose previous buffer is still draining simply does not start
@@ -1050,14 +968,14 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 			startedReads++;
 		}
 	}
-	if (startedReads == 0) {
+	if (startedReads == 0 || fDataDead) {
 		LOG(V_ERROR, "Failed to start any read");
 		rtn = kIOReturnError;
 		goto bailout;
 	}
 	if (startedReads < N_IN_BUFS) {
 		fNeedReadRestart = true;
-		armTxFlushTimer();
+		armRxRetryTimer();
 	}
 
 	// Tell the world that the link is up...
@@ -1084,11 +1002,9 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 	}
 
 #if RNDIS_KEEPALIVE
-	// Start the keep-alive cadence (RNDIS-only; NCM has no keep-alive):
-	if (fProtocol == kProtocolRNDIS) {
-		fKeepaliveEnabled = true;
-		armCtrlTimer(kCtrlTimerKeepalive, RNDIS_KEEPALIVE_US);
-	}
+	// Start the keep-alive cadence:
+	fKeepaliveEnabled = true;
+	armCtrlTimer(kCtrlTimerKeepalive, RNDIS_KEEPALIVE_US);
 #endif
 
 	// Now we can say we're alive.
@@ -1151,6 +1067,10 @@ void HoRNDIS::disableImpl() {
 		fTxFlushTimer->cancelTimeout();
 	}
 	fTxTimerArmed = false;
+	if (fRxRetryTimer) {
+		fRxRetryTimer->cancelTimeout();
+	}
+	fRxTimerArmed = false;
 	fNeedReadRestart = false;
 	if (fTxFillBufIdx >= 0) {
 		// Note: 'numFreeOutBufs' must be in sync: the fill buffer was taken
@@ -1170,11 +1090,6 @@ void HoRNDIS::disableImpl() {
 
 	// If the device has not been disconnected, ask it to stop xmitting:
 	if (fCommInterface) {
-#if NCM_SUPPORT
-		if (fProtocol == kProtocolNCM) {
-			ncmSetPacketFilter(0);
-		} else
-#endif
 		{
 			rndisSetPacketFilter(0);
 		}
@@ -1206,14 +1121,6 @@ void HoRNDIS::disableImpl() {
 	}
 	if (fOutPipe) {
 		fOutPipe->abort(IOUSBHostIOSource::kAbortSynchronous,
-			kIOReturnAborted, NULL);
-	}
-	if (fInPipe2) {
-		fInPipe2->abort(IOUSBHostIOSource::kAbortSynchronous,
-			kIOReturnAborted, NULL);
-	}
-	if (fOutPipe2) {
-		fOutPipe2->abort(IOUSBHostIOSource::kAbortSynchronous,
 			kIOReturnAborted, NULL);
 	}
 	if (fIntPipe) {
@@ -1278,11 +1185,6 @@ bool HoRNDIS::allocateResources() {
 	
 	// Grab a memory descriptor pointer for data-in.
 	uint32_t inSize = IN_BUF_SIZE;
-#if NCM_SUPPORT
-	if (fProtocol == kProtocolNCM && fNcmRxMax > 0) {
-		inSize = fNcmRxMax;
-	}
-#endif
 	for (int i = 0; i < N_IN_BUFS; i++) {
 		// If a previous lease is still outstanding (the network stack
 		// holds cluster references into it), keep it: it drains on its
@@ -1341,9 +1243,6 @@ bool HoRNDIS::allocateResources() {
 	fTxHead = NULL;
 	fTxBytes = 0;
 #endif
-#if NCM_SUPPORT
-	fTxNdpCount = 0;
-#endif
 	fNeedReadRestart = false;
 	
 	return true;
@@ -1366,6 +1265,10 @@ void HoRNDIS::releaseResources() {
 	if (fTxFlushTimer) {
 		fTxFlushTimer->cancelTimeout();
 	}
+	if (fRxRetryTimer) {
+		fRxRetryTimer->cancelTimeout();
+	}
+	fRxTimerArmed = false;
 #if TX_ZEROCOPY
 	// Drop the partially-built zero-copy aggregate chain (never submitted):
 	if (fTxHead) {
@@ -1474,11 +1377,6 @@ IOReturn HoRNDIS::getMaxPacketSize(UInt32 *maxSize) const {
 		return rc;
 	}
 	// The max packet size is limited by the protocol's max frame size:
-#if NCM_SUPPORT
-	if (fProtocol == kProtocolNCM) {
-		*maxSize = min(*maxSize, fNcmMaxDatagram);
-	} else
-#endif
 	{
 		*maxSize = min(*maxSize, maxOutTransferSize - sizeof(rndis_data_hdr));
 	}
@@ -1544,14 +1442,8 @@ IOReturn HoRNDIS::setMulticastMode(bool active) {
 	// filter. 'setMulticastList' is not implemented (we pass all multicast
 	// through when multicast is on), which matches the old behavior while
 	// still keeping the filter minimal when multicast is NOT needed.
-	LOG(V_DEBUG, "%s", active ? "on" : "off");
-	fMulticastEnabled = active;
-#if RNDIS_DYNAMIC_FILTER
-	if (!updatePacketFilter()) {
-		LOG(V_ERROR, "Cannot update packet filter for multicast");
-	}
-#endif
-	return kIOReturnSuccess;
+	return getCommandGate()->runAction(setFilterModeGated,
+		(void *)0, (void *)(uintptr_t)active);
 }
 
 IOReturn HoRNDIS::setMulticastList(IOEthernetAddress *addrs,
@@ -1563,11 +1455,28 @@ IOReturn HoRNDIS::setMulticastList(IOEthernetAddress *addrs,
 
 IOReturn HoRNDIS::setPromiscuousMode(bool active) {
 	// Toggle RNDIS_PACKET_TYPE_PROMISCUOUS in the device's packet filter.
-	LOG(V_DEBUG, "%s", active ? "on" : "off");
-	fPromiscEnabled = active;
+	return getCommandGate()->runAction(setFilterModeGated,
+		(void *)1, (void *)(uintptr_t)active);
+}
+
+IOReturn HoRNDIS::setFilterModeGated(OSObject *owner, void *kind,
+		void *activeArg, void *, void *) {
+	HoRNDIS *me = (HoRNDIS *)owner;
+	ReentryLocker locker(me, me->fEnableDisableInProgress);
+	if (locker.isInterrupted()) {
+		return locker.getResult();
+	}
+	bool &setting = kind ? me->fPromiscEnabled : me->fMulticastEnabled;
+	bool previous = setting;
+	setting = activeArg != NULL;
 #if RNDIS_DYNAMIC_FILTER
-	if (!updatePacketFilter()) {
-		LOG(V_ERROR, "Cannot update packet filter for promiscuous mode");
+	// While disabled, retain the request for the next enable.
+	if (me->fNetifEnabled && me->fReadyToTransfer &&
+	    !me->updatePacketFilter()) {
+		setting = previous;
+		LOG(V_ERROR, "Cannot update packet filter for %s", kind ?
+			"promiscuous mode" : "multicast");
+		return kIOReturnError;
 	}
 #endif
 	return kIOReturnSuccess;
@@ -1622,7 +1531,7 @@ static IOMemoryDescriptor *descriptorForChain(mbuf_t m) {
 }
 #endif
 
-#if RX_ZEROCOPY || NCM_SUPPORT
+#if RX_ZEROCOPY
 // Called when the last mbuf cluster referencing a zero-copy RX buffer is
 // freed: retire the lease (and its buffer) if teardown requested it.
 void HoRNDIS::rxClusterFreed(caddr_t extbuf, u_int extsize, caddr_t extarg) {
@@ -1680,23 +1589,6 @@ bool HoRNDIS::grabFillBuffer() {
 	fTxFillOffset = 0;
 	fTxPacketCount = 0;
 	fRndisLastMessageOffset = 0;
-#if NCM_SUPPORT
-	if (fProtocol == kProtocolNCM) {
-		// Reserve the NTB headers: NTH + alignment pad + NDP:
-		uint32_t pad = ((12 + fNcmNdpAlign - 1) / fNcmNdpAlign)
-			* fNcmNdpAlign - 12;
-		fTxNdpOffset = 12 + pad;
-		fTxFillOffset = fTxNdpOffset + fNcmMaxNdpSize;
-		fTxNdpCount = 0;
-		uint8_t *buf = (uint8_t *)outbufs[fTxFillBufIdx].mdp->getBytesNoCopy();
-		memset(buf, 0, fTxFillOffset);
-		struct ncm_nth16 *nth = (struct ncm_nth16 *)buf;
-		nth->dwSignature = cpu_to_le32(USB_CDC_NCM_NTH16_SIGN);
-		nth->wHeaderLength = cpu_to_le16(sizeof(struct ncm_nth16));
-		nth->wSequence = cpu_to_le16(fNcmSeq++);
-		nth->wNdpIndex = cpu_to_le16((uint16_t)fTxNdpOffset);
-	}
-#endif
 	return true;
 }
 
@@ -1708,17 +1600,18 @@ bool HoRNDIS::submitFillBuffer() {
 		return grabFillBuffer();
 	}
 
-	// OUT pipe selection: NCM with a second bulk pair alternates pipes:
-	IOUSBHostPipe *outPipe = fOutPipe;
-#if NCM_SUPPORT
-	if (fProtocol == kProtocolNCM && fOutPipe2) {
-		fTxOutPipeToggle = !fTxOutPipeToggle;
-		outPipe = fTxOutPipeToggle ? fOutPipe2 : fOutPipe;
+	// An early submission ends this aggregate's deadline. Cancel the actual
+	// one-shot as well as its flag before a new aggregate can arm a timer.
+	if (fTxTimerArmed) {
+		fTxFlushTimer->cancelTimeout();
+		fTxTimerArmed = false;
 	}
-#endif
+
+	// Submit on the RNDIS output pipe.
+	IOUSBHostPipe *outPipe = fOutPipe;
 
 #if TX_ZEROCOPY
-	if (fProtocol == kProtocolRNDIS && fTxHead != NULL && fTxBytes > 0) {
+	if (fTxHead != NULL && fTxBytes > 0) {
 		// Zero-copy TX: wrap the mbuf chain in a scatter-gather descriptor
 		// and send it as a single transfer - no payload copy.
 		const uint32_t xmitLen = fTxBytes;
@@ -1755,7 +1648,7 @@ bool HoRNDIS::submitFillBuffer() {
 				LOG(V_DEBUG, "WRITER: The device was possibly disconnected: ignoring the error");
 			} else {
 				LOG(V_ERROR, "write failed: %08x", ior);
-				fpNetStats->outputErrors += (fProtocol == kProtocolRNDIS ? fTxPacketCount : 1);
+				fpNetStats->outputErrors += fTxPacketCount;
 			}
 			outbuf.dmaBuf->release();
 			outbuf.dmaBuf = NULL;
@@ -1769,7 +1662,7 @@ bool HoRNDIS::submitFillBuffer() {
 		}
 
 		fCallbackCount++;
-		fpNetStats->outputPackets += (fProtocol == kProtocolRNDIS ? fTxPacketCount : 1);
+		fpNetStats->outputPackets += fTxPacketCount;
 		fTxFillBufIdx = -1;
 		fTxTimerArmed = false;
 		return grabFillBuffer();
@@ -1779,11 +1672,6 @@ bool HoRNDIS::submitFillBuffer() {
 	if (fTxFillOffset > 0) {
 		pipebuf_t &outbuf = outbufs[fTxFillBufIdx];
 
-#if NCM_SUPPORT
-		if (fProtocol == kProtocolNCM) {
-			ncmFlushNtb();
-		}
-#endif
 		// 'setLength' is an IOBufferMemoryDescriptor method; the fill
 		// buffer IS the wired descriptor here.
 		outbuf.mdp->setLength(fTxFillOffset);
@@ -1800,7 +1688,7 @@ bool HoRNDIS::submitFillBuffer() {
 				LOG(V_DEBUG, "WRITER: The device was possibly disconnected: ignoring the error");
 			} else {
 				LOG(V_ERROR, "write failed: %08x", ior);
-				fpNetStats->outputErrors += (fProtocol == kProtocolRNDIS ? fTxPacketCount : 1);
+				fpNetStats->outputErrors += fTxPacketCount;
 			}
 			outbufStack[numFreeOutBufs] = (uint16_t)fTxFillBufIdx;
 			numFreeOutBufs++;
@@ -1811,7 +1699,7 @@ bool HoRNDIS::submitFillBuffer() {
 		}
 
 		fCallbackCount++;
-		fpNetStats->outputPackets += (fProtocol == kProtocolRNDIS ? fTxPacketCount : 1);
+		fpNetStats->outputPackets += fTxPacketCount;
 		fTxFillBufIdx = -1;
 		fTxFillOffset = 0;
 		fTxTimerArmed = false;
@@ -1856,6 +1744,22 @@ void HoRNDIS::txFlushTimerFired(OSObject *owner, IOTimerEventSource *timer) {
 		me->submitFillBuffer();
 	}
 #endif
+}
+
+void HoRNDIS::armRxRetryTimer(uint32_t us) {
+	if (fRxTimerArmed || !fRxRetryTimer) {
+		return;
+	}
+	fRxTimerArmed = true;
+	fRxRetryTimer->setTimeoutUS(us);
+}
+
+void HoRNDIS::rxRetryTimerFired(OSObject *owner, IOTimerEventSource *timer) {
+	HoRNDIS *me = (HoRNDIS *)owner;
+	me->fRxTimerArmed = false;
+	if (!me->fReadyToTransfer || me->fDataDead) {
+		return;
+	}
 
 	// RX: retry reads that could not be re-armed (transient failures or
 	// all slots busy). 'startRead' guards slot readiness itself. This
@@ -1878,18 +1782,24 @@ void HoRNDIS::txFlushTimerFired(OSObject *owner, IOTimerEventSource *timer) {
 			if (me->startRead(slot)) {
 				anyInFlight = true;
 			} else {
+				if (me->fDataDead) {
+					me->fNeedReadRestart = false;
+					return;
+				}
 				failedSubmit = true;
 				me->fNeedReadRestart = true;
 			}
 		}
 		if (me->fNeedReadRestart) {
 			if (failedSubmit) {
-				if (!anyInFlight && ++me->fRxFailCount >= 60) {
+				if (!anyInFlight && me->fRxFailCount < 60 &&
+				    ++me->fRxFailCount == 60) {
+					me->fRxLinkDown = true;
 					me->setLinkStatus(kIONetworkLinkValid, 0);
 				}
 				me->fRxRetryUs = min(me->fRxRetryUs * 2, (uint32_t)1000000);
 			}
-			me->armTxFlushTimer(me->fRxRetryUs);
+			me->armRxRetryTimer(me->fRxRetryUs);
 		}
 	}
 }
@@ -1903,31 +1813,31 @@ bool HoRNDIS::startRead(pipebuf_t *inbuf) {
 	inbuf->comp.action = dataReadComplete;
 	inbuf->comp.parameter = inbuf;
 
-	if (inbuf->inFlight || !inbuf->mdp ||
+	if (fDataDead || !fReadyToTransfer || inbuf->inFlight || !inbuf->mdp ||
 		(inbuf->lease && __atomic_load_n(&inbuf->lease->count, __ATOMIC_ACQUIRE) != 1)) {
 		return false;
 	}
 
-	// RX transfer size: NCM uses the negotiated NTB input size:
+	// RX transfer size:
 	uint32_t rxLen = IN_BUF_SIZE;
-#if NCM_SUPPORT
-	if (fProtocol == kProtocolNCM && fNcmRxMax > 0) {
-		rxLen = fNcmRxMax;
-	}
-#endif
 
 	inbuf->dmaBuf = inbuf->mdp;
 	IOReturn rtn = robustIO(inbuf->pipe, inbuf, rxLen);
 	if (rtn != kIOReturnSuccess) {
 		LOG(V_ERROR, "Failed to start a read: %08x", rtn);
 		releaseReadBuffer(inbuf);
+		if (rtn == kIOReturnAborted && fReadyToTransfer) {
+			fDataDead = true;
+			fNeedReadRestart = false;
+			fRxLinkDown = true;
+			setLinkStatus(kIONetworkLinkValid, 0);
+		}
 		return false;
 	}
 	inbuf->inFlight = true;
 	fCallbackCount++;
-	// A successful (re)submit means the reader is healthy again:
-	fRxFailCount = 0;
-	fRxRetryUs = TX_FLUSH_US;
+	// A submission alone does not prove recovery; wait for a successful
+	// completion before resetting the error streak and backoff.
 	return true;
 }
 
@@ -1962,53 +1872,6 @@ UInt32 HoRNDIS::outputPacket(mbuf_t packet, void *param) {
 	
 	LOG(V_PACKET, "%ld bytes", pktlen);
 
-#if NCM_SUPPORT
-	if (fProtocol == kProtocolNCM) {
-		// NCM: raw Ethernet frames packed into NTBs (no per-packet header).
-		if (pktlen > fNcmMaxDatagram || pktlen > 0xFFFF) {
-			LOG(V_ERROR, "packet too large (%ld bytes, max %u)",
-				pktlen, fNcmMaxDatagram);
-			fpNetStats->outputErrors++;
-			freePacket(packet);
-			return kIOReturnOutputDropped;
-		}
-		if (fTxFillBufIdx < 0) {
-			if (!grabFillBuffer()) {
-				return kIOOutputStatusRetry | kIOOutputCommandStall;
-			}
-		}
-		if (!ncmAppendPacket(packet, pktlen)) {
-			// The frame does not fit: flush the NTB and try again.
-			if (!submitFillBuffer()) {
-				// Packet not consumed: stall, keep it for later.
-				return kIOOutputStatusRetry | kIOOutputCommandStall;
-			}
-			if (!ncmAppendPacket(packet, pktlen)) {
-				// Cannot happen (the fresh NTB is empty):
-				LOG(V_ERROR, "BUG: frame does not fit an empty NTB");
-				fpNetStats->outputErrors++;
-				freePacket(packet);
-				return kIOReturnOutputDropped;
-			}
-		}
-		freePacket(packet);
-
-		// Flush when full, otherwise let the timer flush the tail:
-		if (fTxFillOffset >= fNcmTxMax ||
-			fTxNdpCount >= fNcmMaxDatagrams) {
-			submitFillBuffer();
-		} else {
-			armTxFlushTimer();
-		}
-
-		const bool stallQueue = (numFreeOutBufs == 0);
-		if (stallQueue) {
-			LOG(V_PACKET, "Issuing stall command to the output queue");
-		}
-		return kIOOutputStatusAccepted |
-			(stallQueue ? kIOOutputCommandStall : kIOOutputCommandNone);
-	}
-#endif
 
 	if (pktlen > maxOutTransferSize - sizeof(struct rndis_data_hdr)) {
 		LOG(V_ERROR, "packet too large (%ld bytes, maximum can transmit %u)",
@@ -2202,14 +2065,44 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 	HoRNDIS	*me = (HoRNDIS *)obj;
 	pipebuf_t *inbuf = (pipebuf_t *)param;
 
-	// Stop conditions. Not separating them out, since reacting to individual
-	// ones would be very timing-sansitive.
-	if (isTransferStopStatus(rc) || !me->fReadyToTransfer) {
-		LOG(V_DEBUG, "READER STOPPED: USB device aborted or not responding, "
-			"or 'fReadyToTransfer' flag is cleared.");
+	// Abort is terminal for this enable; other failures may be transient.
+	if (rc == kIOReturnAborted && me->fReadyToTransfer) {
+		me->fDataDead = true;
+		me->fNeedReadRestart = false;
+		me->fRxLinkDown = true;
+		me->setLinkStatus(kIONetworkLinkValid, 0);
+	}
+	if (me->fDataDead || !me->fReadyToTransfer) {
 		me->releaseReadBuffer(inbuf);
 		me->callbackExit();
 		return;
+	}
+	if (rc != kIOReturnSuccess) {
+		LOG(V_ERROR, "dataReadComplete: I/O error: %08x", rc);
+		me->releaseReadBuffer(inbuf);
+		bool anyInFlight = false;
+		for (int i = 0; i < N_IN_BUFS; i++) {
+			anyInFlight |= me->inbufs[i].inFlight;
+		}
+		if (!anyInFlight && me->fRxFailCount < 60 &&
+		    ++me->fRxFailCount == 60) {
+			me->fRxLinkDown = true;
+			me->setLinkStatus(kIONetworkLinkValid, 0);
+		}
+		me->fNeedReadRestart = true;
+		me->armRxRetryTimer(me->fRxRetryUs);
+		me->fRxRetryUs = min(me->fRxRetryUs * 2, (uint32_t)1000000);
+		me->callbackExit();
+		return;
+	}
+	if (rc == kIOReturnSuccess) {
+		me->fRxFailCount = 0;
+		me->fRxRetryUs = TX_FLUSH_US;
+		if (me->fRxLinkDown && me->fNetifEnabled &&
+		    me->setLinkStatus(kIONetworkLinkActive | kIONetworkLinkValid,
+		                      me->getCurrentMedium())) {
+			me->fRxLinkDown = false;
+		}
 	}
 
 #if RX_ZEROCOPY
@@ -2222,11 +2115,6 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 		// is done with every packet).
 		LOG(V_PACKET, "Reader(%ld), tid=%lld: %d bytes", inbuf - me->inbufs,
 			thread_tid(current_thread()), transferred);
-#if NCM_SUPPORT
-		if (me->fProtocol == kProtocolNCM) {
-			me->ncmReceivePacket(inbuf, transferred);
-		} else
-#endif
 		{
 			me->receivePacketZeroCopy(inbuf, transferred);
 		}
@@ -2242,13 +2130,23 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 			break;
 		}
 	}
+	if (me->fDataDead) {
+		me->callbackExit();
+		return;
+	}
+	if (!inbuf->inFlight) {
+		// Another slot may have been rearmed while this buffer is still held
+		// by the stack. Retry it too, or the reader pool can shrink forever.
+		me->fNeedReadRestart = true;
+		me->armRxRetryTimer();
+	}
 	if (rearmed) {
 		// startRead added a new in-flight callback reference; retire this one.
 		me->callbackExit();
 		return;
 	}
 	me->fNeedReadRestart = true;
-	me->armTxFlushTimer();  // Retry tick (see 'txFlushTimerFired').
+	me->armRxRetryTimer();
 	me->callbackExit();
 #else
 	inbuf->inFlight = false;
@@ -2271,24 +2169,18 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 	}
 
 	LOG(V_ERROR, "READER STOPPED: USB failure trying to read: %08x", ior);
-	me->callbackExit();
-	me->fDataDead = true;
-	// Transient USB errors (device suspend, lock-screen power saving,
-	// pipe stalls) must NOT kill the interface: retry the reader with
-	// exponential backoff, and only report link down after sustained
-	// failure (~1 minute). The original driver simply stopped reading
-	// here, which is why it "survived" these events.
-	me->fRxFailCount++;
-	if (me->fRxFailCount < 60) {
-		if (me->fRxRetryUs < 1000000) {
-			me->fRxRetryUs *= 2;
-		}
-		me->fNeedReadRestart = true;
-		me->armTxFlushTimer(me->fRxRetryUs);
-	} else {
-		// Sustained failure: report link down so the stack can fail over.
+	me->releaseReadBuffer(inbuf);
+	if (ior == kIOReturnAborted) {
+		me->fDataDead = true;
+		me->fNeedReadRestart = false;
+		me->fRxLinkDown = true;
 		me->setLinkStatus(kIONetworkLinkValid, 0);
+	} else {
+		// Continue retrying even after the link has been reported down.
+		me->fNeedReadRestart = true;
+		me->armRxRetryTimer(me->fRxRetryUs);
 	}
+	me->callbackExit();
 #endif
 }
 
@@ -2356,7 +2248,7 @@ void HoRNDIS::receivePacket(void *packet, UInt32 size) {
 	}
 }
 
-#if RX_ZEROCOPY || NCM_SUPPORT
+#if RX_ZEROCOPY
 /*!
  * Zero-copy RNDIS receive: the transfer landed in the slot's wired buffer
  * ('slot->mdp'). Each PDU is handed to the network stack as an mbuf whose
@@ -2664,14 +2556,6 @@ void HoRNDIS::dataIntReadComplete(void *obj, void *param, IOReturn rc, UInt32 tr
 }
 
 void HoRNDIS::handleInterruptData(const void *data, UInt32 len) {
-#if NCM_SUPPORT
-	if (fProtocol == kProtocolNCM) {
-		// CDC notifications (NETWORK_CONNECTION etc.); NCM has no
-		// encapsulated-command responses to wait for.
-		ncmHandleNotification(data, len);
-		return;
-	}
-#endif
 
 	// RESPONSE_AVAILABLE is a CDC notification. Its RNDIS payload is
 	// retrieved separately through GET_ENCAPSULATED_RESPONSE.
@@ -2686,7 +2570,7 @@ void HoRNDIS::handleInterruptData(const void *data, UInt32 len) {
 void HoRNDIS::handleIndication(uint32_t status) {
 	if (status == le32_to_cpu(RNDIS_STATUS_MEDIA_CONNECT)) {
 		LOG(V_NOTE, "Media connect indication");
-		if (fNetifEnabled) {
+		if (fNetifEnabled && fReadyToTransfer && !fDataDead && !fRxLinkDown) {
 			setLinkStatus(kIONetworkLinkActive | kIONetworkLinkValid,
 				getCurrentMedium());
 		}
@@ -2799,34 +2683,6 @@ bool HoRNDIS::updatePacketFilter() {
 		return false;
 	}
 
-#if NCM_SUPPORT
-	if (fProtocol == kProtocolNCM) {
-		// CDC filter bits (different encoding than RNDIS):
-		uint32_t filter = USB_CDC_PACKET_TYPE_DIRECTED |
-			USB_CDC_PACKET_TYPE_BROADCAST;
-#if RNDIS_DYNAMIC_FILTER
-		if (fMulticastEnabled) {
-			filter |= USB_CDC_PACKET_TYPE_ALL_MULTICAST;
-		}
-		if (fPromiscEnabled) {
-			filter |= USB_CDC_PACKET_TYPE_PROMISCUOUS;
-		}
-#else
-		filter |= USB_CDC_PACKET_TYPE_ALL_MULTICAST |
-			USB_CDC_PACKET_TYPE_PROMISCUOUS;
-#endif
-		if (filter == fCurrentFilter) {
-			return true;  // Nothing to do.
-		}
-		if (!ncmSetPacketFilter(filter)) {
-			LOG(V_ERROR, "Cannot set the NCM packet filter to %08x", filter);
-			return false;
-		}
-		fCurrentFilter = filter;
-		LOG(V_DEBUG, "NCM packet filter is now %08x", filter);
-		return true;
-	}
-#endif
 
 #if RNDIS_DYNAMIC_FILTER
 	uint32_t filter = RNDIS_PACKET_TYPE_DIRECTED | RNDIS_PACKET_TYPE_BROADCAST;
@@ -3004,345 +2860,3 @@ bool HoRNDIS::rndisSetPacketFilter(uint32_t filter) {
 	
 	return true;
 }
-
-#if NCM_SUPPORT
-/***** CDC NCM protocol layer *****/
-
-// Direct CDC class control request on the control interface. Unlike RNDIS
-// there is no encapsulated-command indirection: the data comes back in the
-// same control transfer, so this is a single synchronous request.
-IOReturn HoRNDIS::ncmControlRequest(uint8_t bRequest, uint16_t wValue,
-	void *data, uint16_t wLength, bool isIn) {
-	if (!fCommInterface) {
-		return kIOReturnError;
-	}
-	DeviceRequest rq;
-	rq.bmRequestType =
-		(isIn ? kDeviceRequestDirectionIn : kDeviceRequestDirectionOut) |
-		kDeviceRequestTypeClass | kDeviceRequestRecipientInterface;
-	rq.bRequest = bRequest;
-	rq.wValue = wValue;
-	rq.wIndex = fCommInterface->getInterfaceDescriptor()->bInterfaceNumber;
-	rq.wLength = wLength;
-	uint32_t transferred = 0;
-	IOReturn rc = fCommInterface->deviceRequest(rq, data, transferred);
-	if (rc != kIOReturnSuccess) {
-		LOG(V_DEBUG, "NCM control request %02x failed: %08x", bRequest, rc);
-		return rc;
-	}
-	if (transferred != wLength) {
-		LOG(V_ERROR, "NCM control request %02x: short transfer (%d of %d)",
-			bRequest, transferred, wLength);
-		return kIOReturnError;
-	}
-	return kIOReturnSuccess;
-}
-
-// Initial one-time device setup; mirrors Linux cdc_ncm.c 'cdc_ncm_init'.
-bool HoRNDIS::ncmInit() {
-#if !RX_ZEROCOPY
-	// The NCM RX path is zero-copy only (cluster-mbuf based); build
-	// with RX_ZEROCOPY=1 or disable NCM_SUPPORT.
-	LOG(V_ERROR, "NCM support requires RX_ZEROCOPY=1");
-	return false;
-#endif
-	// 1. NTB format: we speak NTB16 (format 0, the device default). If the
-	//    device reports another format, request 16-bit explicitly.
-	uint16_t format = 0xFFFF;
-	if (ncmControlRequest(USB_CDC_GET_NTB_FORMAT, 0, &format,
-			sizeof(format), true) == kIOReturnSuccess) {
-		if (le16_to_cpu(format) != USB_CDC_NCM_NTB16_FORMAT) {
-			uint16_t newFmt = USB_CDC_NCM_NTB16_FORMAT;
-			if (ncmControlRequest(USB_CDC_SET_NTB_FORMAT, 0, &newFmt,
-					sizeof(newFmt), false) != kIOReturnSuccess) {
-				LOG(V_ERROR, "Cannot select the NTB16 format "
-					"(device reported %04x)", le16_to_cpu(format));
-				return false;
-			}
-		}
-	} else {
-		LOG(V_DEBUG, "GET_NTB_FORMAT unsupported; assuming NTB16");
-	}
-
-	// 2. NTB parameters (required):
-	struct ncm_ntb_parameters parm;
-	if (ncmControlRequest(USB_CDC_GET_NTB_PARAMETERS, 0, &parm,
-			sizeof(parm), true) != kIOReturnSuccess) {
-		LOG(V_ERROR, "GET_NTB_PARAMETERS failed");
-		return false;
-	}
-
-	uint32_t rxMax = le32_to_cpu(parm.dwNtbInMaxSize);
-	uint32_t txMax = le32_to_cpu(parm.dwNtbOutMaxSize);
-	// Clamp to sane bounds (mirrors Linux cdc_ncm.c):
-	if (rxMax < NCM_NTB_MIN_SIZE) {
-		LOG(V_NOTE, "dwNtbInMaxSize=%u is too small; using %d",
-			rxMax, NCM_NTB_DEF_SIZE);
-		rxMax = NCM_NTB_DEF_SIZE;
-	}
-	rxMax = min(rxMax, (uint32_t)NCM_NTB_MAX_SIZE);
-	if (txMax < NCM_NTB_MIN_SIZE) {
-		LOG(V_NOTE, "dwNtbOutMaxSize=%u is too small; using %d",
-			txMax, NCM_NTB_DEF_SIZE);
-		txMax = NCM_NTB_DEF_SIZE;
-	}
-	txMax = min(txMax, (uint32_t)NCM_NTB_MAX_SIZE);
-	fNcmRxMax = rxMax;
-	// The TX NTB has to fit into the existing OUT buffers:
-	fNcmTxMax = min(txMax, (uint32_t)OUT_BUF_SIZE);
-
-	fNcmNdpAlign = le16_to_cpu(parm.wNdpOutAlignment);
-	if (fNcmNdpAlign < NCM_NDP_ALIGN_MIN) {
-		fNcmNdpAlign = NCM_NDP_ALIGN_MIN;
-	}
-	fNcmModulus = le16_to_cpu(parm.wNdpOutDivisor);
-	if (fNcmModulus < NCM_NDP_ALIGN_MIN) {
-		fNcmModulus = NCM_NDP_ALIGN_MIN;
-	}
-	fNcmRemainder = le16_to_cpu(parm.wNdpOutPayloadRemainder);
-	if (fNcmRemainder >= fNcmModulus) {
-		// Bogus remainder would break the alignment math:
-		fNcmRemainder = 0;
-	}
-	fNcmMaxDatagrams = le16_to_cpu(parm.wNtbOutMaxDatagrams);
-	if (fNcmMaxDatagrams == 0 || fNcmMaxDatagrams > NCM_DPT_DATAGRAMS_MAX) {
-		fNcmMaxDatagrams = NCM_DPT_DATAGRAMS_MAX;
-	}
-	fNcmMaxNdpSize = (uint16_t)(sizeof(struct ncm_ndp16) +
-		(fNcmMaxDatagrams + 1) * 2 * sizeof(uint16_t));
-	fNcmSeq = 0;
-
-	LOG(V_NOTE, "NCM: rxMax=%u txMax=%u ndpAlign=%u modulus=%u "
-		"remainder=%u maxDatagrams=%u maxNdpSize=%u",
-		fNcmRxMax, fNcmTxMax, fNcmNdpAlign, fNcmModulus,
-		fNcmRemainder, fNcmMaxDatagrams, fNcmMaxNdpSize);
-
-	// 3. Tell the device our RX NTB size (required before RX works):
-	uint32_t rxSize = fNcmRxMax;
-	if (ncmControlRequest(USB_CDC_SET_NTB_INPUT_SIZE, 0, &rxSize,
-			sizeof(rxSize), false) != kIOReturnSuccess) {
-		LOG(V_ERROR, "SET_NTB_INPUT_SIZE failed");
-		return false;
-	}
-
-	// 4. MAC address (cache it; the network stack reads it via
-	//    'getHardwareAddress'):
-	unsigned char mac[6];
-	if (ncmControlRequest(USB_CDC_GET_NET_ADDRESS, 0, mac, sizeof(mac),
-			true) == kIOReturnSuccess) {
-		bool allZero = true;
-		for (int i = 0; i < 6; i++) {
-			if (mac[i] != 0) {
-				allZero = false;
-				break;
-			}
-		}
-		if (!allZero) {
-			memcpy(fHardwareAddress.bytes, mac, 6);
-			fHasHardwareAddress = true;
-			LOG(V_NOTE, "NCM MAC %02x:%02x:%02x:%02x:%02x:%02x",
-				mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-		}
-	}
-	if (!fHasHardwareAddress) {
-		ncmFallbackMAC();
-	}
-
-	// 5. Max datagram (frame) size, for the MTU:
-	uint16_t maxDgram = 0;
-	if (ncmControlRequest(USB_CDC_GET_MAX_DATAGRAM_SIZE, 0, &maxDgram,
-			sizeof(maxDgram), true) == kIOReturnSuccess) {
-		maxDgram = le16_to_cpu(maxDgram);
-	}
-	if (maxDgram < NCM_MIN_DATAGRAM_SIZE || maxDgram > NCM_MAX_DATAGRAM_SIZE) {
-		maxDgram = NCM_MIN_DATAGRAM_SIZE;
-	}
-	fNcmMaxDatagram = maxDgram;
-	LOG(V_NOTE, "NCM max datagram size: %u", fNcmMaxDatagram);
-
-	return true;
-}
-
-// Fabricate a locally-administered, per-device deterministic MAC so the
-// interface identity is stable when the device reports no address.
-void HoRNDIS::ncmFallbackMAC() {
-	uint16_t vid = 0, pid = 0;
-	if (fCommInterface && fCommInterface->getDevice() &&
-		fCommInterface->getDevice()->getDeviceDescriptor()) {
-		const DeviceDescriptor *dd =
-			fCommInterface->getDevice()->getDeviceDescriptor();
-		vid = le16_to_cpu(dd->idVendor);
-		pid = le16_to_cpu(dd->idProduct);
-	}
-	fHardwareAddress.bytes[0] = 0x02;
-	fHardwareAddress.bytes[1] = (unsigned char)(vid >> 8);
-	fHardwareAddress.bytes[2] = (unsigned char)(vid & 0xFF);
-	fHardwareAddress.bytes[3] = (unsigned char)(pid >> 8);
-	fHardwareAddress.bytes[4] = (unsigned char)(pid & 0xFF);
-	fHardwareAddress.bytes[5] = 0x01;
-	fHasHardwareAddress = true;
-	LOG(V_NOTE, "Fabricated NCM MAC %02x:%02x:%02x:%02x:%02x:%02x",
-		fHardwareAddress.bytes[0], fHardwareAddress.bytes[1],
-		fHardwareAddress.bytes[2], fHardwareAddress.bytes[3],
-		fHardwareAddress.bytes[4], fHardwareAddress.bytes[5]);
-}
-
-bool HoRNDIS::ncmSetPacketFilter(uint32_t filter) {
-	uint16_t f = (uint16_t)filter;
-	return ncmControlRequest(USB_CDC_SET_ETHERNET_PACKET_FILTER, 0, &f,
-		sizeof(f), false) == kIOReturnSuccess;
-}
-
-// Align the fill offset per the device's datagram alignment rules and
-// append the frame into the TX NTB (copy-based; Ethernet frames are short
-// enough that this copy is not the bottleneck). Returns false when the
-// frame does not fit; 'packet' is consumed only on success.
-bool HoRNDIS::ncmAppendPacket(mbuf_t packet, size_t pktlen) {
-	uint32_t align = (fTxFillOffset - fNcmRemainder) % fNcmModulus;
-	uint32_t pad = align ? (fNcmModulus - align) : 0;
-	if (fTxFillOffset + pad + pktlen > fNcmTxMax) {
-		return false;
-	}
-	uint8_t *buf = (uint8_t *)outbufs[fTxFillBufIdx].mdp->getBytesNoCopy();
-	if (pad) {
-		memset(buf + fTxFillOffset, 0, pad);
-		fTxFillOffset += pad;
-	}
-	mbuf_copydata(packet, 0, pktlen, buf + fTxFillOffset);
-	fTxNdpEntries[fTxNdpCount].index = (uint16_t)fTxFillOffset;
-	fTxNdpEntries[fTxNdpCount].len = (uint16_t)pktlen;
-	fTxNdpCount++;
-	fTxFillOffset += (uint32_t)pktlen;
-	return true;
-}
-
-// Materialize the NTH/NDP headers of the TX NTB sitting in the fill buffer
-// (called by 'submitFillBuffer' right before the transfer goes out).
-void HoRNDIS::ncmFlushNtb() {
-	if (fTxFillBufIdx < 0 || fTxFillOffset == 0) {
-		return;
-	}
-	uint8_t *buf = (uint8_t *)outbufs[fTxFillBufIdx].mdp->getBytesNoCopy();
-	struct ncm_nth16 *nth = (struct ncm_nth16 *)buf;
-	nth->wBlockLength = cpu_to_le16((uint16_t)fTxFillOffset);
-
-	struct ncm_ndp16 *ndp = (struct ncm_ndp16 *)(buf + fTxNdpOffset);
-	ndp->dwSignature = cpu_to_le32(USB_CDC_NCM_NDP16_NOCRC_SIGN);
-	ndp->wLength = cpu_to_le16((uint16_t)(sizeof(struct ncm_ndp16) +
-		(fTxNdpCount + 1) * 2 * sizeof(uint16_t)));
-	ndp->wNextNdpIndex = 0;
-	uint16_t *e = (uint16_t *)(ndp + 1);
-	for (int i = 0; i < fTxNdpCount; i++) {
-		e[2 * i] = cpu_to_le16(fTxNdpEntries[i].index);
-		e[2 * i + 1] = cpu_to_le16(fTxNdpEntries[i].len);
-	}
-	e[2 * fTxNdpCount] = 0;      // Terminator pair (index, len) == (0, 0).
-	e[2 * fTxNdpCount + 1] = 0;
-}
-
-// Parse a received NTB and hand its datagrams to the network stack.
-// Zero-copy: each datagram becomes a cluster mbuf referencing the buffer
-// directly ('submitClusterPacket'). The slot's lease refcount keeps the
-// buffer alive until the stack releases every packet.
-void HoRNDIS::ncmReceivePacket(pipebuf_t *slot, UInt32 size) {
-	uint8_t *buf = (uint8_t *)slot->mdp->getBytesNoCopy();
-
-	if (size == 0) {
-		return;
-	}
-
-	struct ncm_nth16 nth;
-	if (size < sizeof(nth)) {
-		LOG(V_ERROR, "NCM RX: transfer too small (%d)", size);
-		return;
-	}
-	memcpy(&nth, buf, sizeof(nth));
-	if (nth.dwSignature != cpu_to_le32(USB_CDC_NCM_NTH16_SIGN)) {
-		LOG(V_ERROR, "NCM RX: bad NTH signature %08x",
-			le32_to_cpu(nth.dwSignature));
-		return;
-	}
-	uint16_t hdrLen = le16_to_cpu(nth.wHeaderLength);
-	uint16_t blockLen = le16_to_cpu(nth.wBlockLength);
-	if (hdrLen != sizeof(nth) || blockLen < hdrLen || blockLen > size) {
-		LOG(V_ERROR, "NCM RX: bad NTH lengths (hdr %d, block %d, size %d)",
-			hdrLen, blockLen, size);
-		return;
-	}
-	uint16_t ndpIndex = le16_to_cpu(nth.wNdpIndex);
-	if (ndpIndex < hdrLen || ndpIndex + 8 > blockLen) {
-		LOG(V_ERROR, "NCM RX: bad NDP index %d", ndpIndex);
-		return;
-	}
-
-	// Walk the (possibly chained) NDPs and extract the datagrams:
-	while (ndpIndex != 0) {
-		struct ncm_ndp16 ndp;
-		if (ndpIndex + 8 > blockLen) {
-			LOG(V_ERROR, "NCM RX: NDP out of bounds");
-			return;
-		}
-		memcpy(&ndp, buf + ndpIndex, sizeof(ndp));
-		if (ndp.dwSignature != cpu_to_le32(USB_CDC_NCM_NDP16_NOCRC_SIGN) &&
-			ndp.dwSignature != cpu_to_le32(USB_CDC_NCM_NDP16_CRC_SIGN)) {
-			LOG(V_ERROR, "NCM RX: bad NDP signature %08x",
-				le32_to_cpu(ndp.dwSignature));
-			return;
-		}
-		uint16_t ndpLen = le16_to_cpu(ndp.wLength);
-		uint16_t nextNdp = le16_to_cpu(ndp.wNextNdpIndex);
-		if (ndpLen < sizeof(ndp) + 4 || ndpIndex + ndpLen > blockLen) {
-			LOG(V_ERROR, "NCM RX: bad NDP length %d", ndpLen);
-			return;
-		}
-
-		uint16_t nEntries = (ndpLen - sizeof(ndp)) / 4;  // Includes terminator.
-		for (uint16_t i = 0; i < nEntries; i++) {
-			uint16_t vals[2];
-			memcpy(vals, buf + ndpIndex + sizeof(ndp) + 4 * i, sizeof(vals));
-			uint16_t dgIndex = le16_to_cpu(vals[0]);
-			uint16_t dgLen = le16_to_cpu(vals[1]);
-			if (dgIndex == 0 && dgLen == 0) {
-				break;  // End of this NDP.
-			}
-			if (dgLen < 14 || dgIndex + dgLen > blockLen) {
-				LOG(V_ERROR, "NCM RX: datagram out of bounds "
-					"(index %d, len %d)", dgIndex, dgLen);
-				return;
-			}
-			if (!submitClusterPacket(buf + dgIndex, dgLen, slot->lease)) {
-				LOG(V_ERROR, "NCM RX: submitClusterPacket failed");
-				fpNetStats->inputErrors++;
-				return;
-			}
-			LOG(V_PACKET, "submitted pkt sz %d", dgLen);
-		}
-		ndpIndex = nextNdp;
-	}
-}
-
-// CDC notification on the interrupt pipe:
-//   bmRequestType == 0xA1, bNotificationType == 0 (NETWORK_CONNECTION),
-//   wValue == 1/0 -> link up/down.
-void HoRNDIS::ncmHandleNotification(const void *data, UInt32 len) {
-	const uint8_t *p = (const uint8_t *)data;
-	if (len < 8 || p[0] != 0xA1 ||
-		p[1] != USB_CDC_NOTIFY_NETWORK_CONNECTION) {
-		LOG(V_DEBUG, "NCM: unhandled notification");
-		return;
-	}
-	uint16_t connected = p[2] | (p[3] << 8);
-	if (connected) {
-		LOG(V_NOTE, "NCM: network connected notification");
-		if (fNetifEnabled) {
-			setLinkStatus(kIONetworkLinkActive | kIONetworkLinkValid,
-				getCurrentMedium());
-		}
-	} else {
-		LOG(V_NOTE, "NCM: network disconnected notification");
-		if (fNetifEnabled) {
-			setLinkStatus(kIONetworkLinkValid, 0);
-		}
-	}
-}
-#endif /* NCM_SUPPORT */

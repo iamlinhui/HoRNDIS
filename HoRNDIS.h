@@ -107,13 +107,6 @@ extern "C"
 #define TX_ZEROCOPY             0
 #endif
 
-// NCM_SUPPORT: additionally implement the CDC Network Control Model
-// (Ethernet over USB, NTB16) protocol alongside RNDIS. The protocol is
-// selected at probe time: a 02/0D/00 control interface picks NCM, anything
-// else matching the RNDIS personalities keeps RNDIS. Set to 0 to build a
-// pure RNDIS driver.
-#define NCM_SUPPORT             1
-
 // RNDIS_DYNAMIC_FILTER: keep the device's packet filter minimal (unicast +
 // broadcast), adding multicast-all / promiscuous only while the network
 // stack actually requests them (setMulticastMode/setPromiscuousMode). This
@@ -307,94 +300,6 @@ struct rndis_set_c {
 #define USB_CDC_GET_ENCAPSULATED_RESPONSE       0x01
 #define USB_CDC_UNION_TYPE                      0x06
 
-/***** CDC NCM definitions -- from linux/include/linux/usb/cdc_ncm.h,
- ***** include/uapi/linux/usb/cdc.h and drivers/net/usb/cdc_ncm.c *****/
-
-#if NCM_SUPPORT
-
-// Control interface matching: Communications class / Network Control Model:
-#define NCM_IF_CLASS            2
-#define NCM_IF_SUBCLASS         0x0D
-
-// Functional descriptor subtypes (bDescriptorType == 0x24, CS_INTERFACE):
-#define USB_CDC_HEADER_TYPE     0x00
-#define USB_CDC_ETHERNET_TYPE   0x0F
-#define USB_CDC_NCM_TYPE        0x1A
-
-// Control requests (class, interface recipient):
-#define USB_CDC_SET_ETHERNET_MULTICAST_FILTERS  0x40
-#define USB_CDC_SET_ETHERNET_PACKET_FILTER      0x43
-#define USB_CDC_GET_NTB_PARAMETERS              0x80
-#define USB_CDC_GET_NET_ADDRESS                 0x81
-#define USB_CDC_SET_NET_ADDRESS                 0x82
-#define USB_CDC_GET_NTB_FORMAT                  0x83
-#define USB_CDC_SET_NTB_FORMAT                  0x84
-#define USB_CDC_GET_NTB_INPUT_SIZE              0x85
-#define USB_CDC_SET_NTB_INPUT_SIZE              0x86
-#define USB_CDC_GET_MAX_DATAGRAM_SIZE           0x87
-#define USB_CDC_SET_MAX_DATAGRAM_SIZE           0x88
-
-// CDC packet-filter bits (different encoding than RNDIS!):
-#define USB_CDC_PACKET_TYPE_PROMISCUOUS         0x01
-#define USB_CDC_PACKET_TYPE_ALL_MULTICAST       0x02
-#define USB_CDC_PACKET_TYPE_DIRECTED            0x04
-#define USB_CDC_PACKET_TYPE_BROADCAST           0x08
-#define USB_CDC_PACKET_TYPE_MULTICAST           0x10
-
-// CDC notification on the interrupt pipe:
-//   byte 0: bmRequestType == 0xA1
-//   byte 1: bNotificationType == 0x00 (NETWORK_CONNECTION)
-//   bytes 2-3: wValue (1 = connected, 0 = disconnected)
-#define USB_CDC_NOTIFY_NETWORK_CONNECTION       0x00
-
-// NTB16 signatures (on the wire, little-endian):
-#define USB_CDC_NCM_NTH16_SIGN          0x484D434E /* "NCMH" */
-#define USB_CDC_NCM_NDP16_NOCRC_SIGN    0x304D434E /* "NCM0" */
-#define USB_CDC_NCM_NDP16_CRC_SIGN      0x314D434E /* "NCM1" */
-#define USB_CDC_NCM_NTB16_FORMAT        0x00
-
-// Sane bounds (from Linux cdc_ncm.h / cdc_ncm.c):
-#define NCM_NTB_MIN_SIZE                2048
-#define NCM_NTB_MAX_SIZE                65536
-#define NCM_NTB_DEF_SIZE                16384
-#define NCM_DPT_DATAGRAMS_MAX           40
-#define NCM_NDP_ALIGN_MIN               4
-#define NCM_MIN_DATAGRAM_SIZE           1514
-#define NCM_MAX_DATAGRAM_SIZE           8192
-
-struct ncm_nth16 {
-	uint32_t dwSignature;
-	uint16_t wHeaderLength;
-	uint16_t wSequence;
-	uint16_t wBlockLength;
-	uint16_t wNdpIndex;
-} __attribute__((packed));
-
-struct ncm_ndp16 {
-	uint32_t dwSignature;
-	uint16_t wLength;
-	uint16_t wNextNdpIndex;
-	// Followed by (wDatagramIndex, wDatagramLength) uint16 pairs and a
-	// (0, 0) terminator pair.
-} __attribute__((packed));
-
-struct ncm_ntb_parameters {
-	uint16_t wLength;
-	uint16_t bmNtbFormatsSupported;
-	uint32_t dwNtbInMaxSize;
-	uint16_t wNdpInDivisor;
-	uint16_t wNdpInPayloadRemainder;
-	uint16_t wNdpInAlignment;
-	uint16_t wPadding1;
-	uint32_t dwNtbOutMaxSize;
-	uint16_t wNdpOutDivisor;
-	uint16_t wNdpOutPayloadRemainder;
-	uint16_t wNdpOutAlignment;
-	uint16_t wNtbOutMaxDatagrams;
-} __attribute__((packed));
-
-#endif /* NCM_SUPPORT */
-
 /***** Actual class definitions *****/
 
 // Zero-copy RX buffer lease: heap-allocated, referenced by every
@@ -415,8 +320,7 @@ typedef struct {
 	RxBufLease *lease;
 	// True while a transfer is outstanding on this slot.
 	bool inFlight;
-	// The pipe this buffer is submitted on (RX slots; TX slots always use
-	// the first OUT pipe for RNDIS, alternating pipes for NCM).
+	// The pipe this buffer is submitted on (RX slots).
 	IOUSBHostPipe *pipe;
 #if TX_ZEROCOPY
 	// Zero-copy TX: the in-flight aggregate chain (freed on completion).
@@ -467,19 +371,13 @@ private:
 	// set to false when 'disable' succeeds:
 	bool fNetifEnabled;
 	bool fEnableDisableInProgress;  // Guards against re-entry
-	bool fDataDead;
+	bool fDataDead;  // A terminal RX stop status was observed.
+	bool fRxLinkDown;  // Link was reported down by RX recovery.
 
 	// These pass information from 'probe' to 'openUSBInterfaces':
 	uint8_t fProbeConfigVal;
 	uint8_t fProbeCommIfNum;
-	uint8_t fProbeDataIfNum;  // NCM: from the Union descriptor; RNDIS: comm+1.
-
-	// Which protocol this instance runs (chosen in 'probe'):
-	enum HoRNDISProtocol {
-		kProtocolRNDIS = 0,
-		kProtocolNCM
-	};
-	HoRNDISProtocol fProtocol;
+	uint8_t fProbeDataIfNum;  // Union descriptor, or control interface + 1.
 
 	// fCallbackCount is the number of callbacks concurrently running
 	// (possibly offset by a certain value).
@@ -494,15 +392,8 @@ private:
 	
 	IOUSBHostPipe *fInPipe;
 	IOUSBHostPipe *fOutPipe;
-	// Second bulk pair: NCM data interfaces may expose two IN and two OUT
-	// bulk endpoints ("two endpoints" per the module documentation). RNDIS
-	// instances leave these NULL.
-	IOUSBHostPipe *fInPipe2;
-	IOUSBHostPipe *fOutPipe2;
-	bool fTxOutPipeToggle;  // Alternates OUT pipes for NCM transfers.
 	// Interrupt pipe of the control interface (optional): carries
-	// response-available (RNDIS) and media connect/disconnect (CDC)
-	// notifications.
+	// response-available notifications.
 	IOUSBHostPipe *fIntPipe;
 	pipebuf_t fIntBuf;    // Interrupt reader buffer.
 	bool fIntReadActive;  // Interrupt reader loop is running.
@@ -563,30 +454,10 @@ private:
 	uint32_t fTxBytes;
 #endif
 
-#if NCM_SUPPORT
-	// NCM state, negotiated by 'ncmInit':
-	uint32_t fNcmRxMax;       // RX transfer (NTB input) size.
-	uint32_t fNcmTxMax;       // TX NTB size (<= OUT_BUF_SIZE).
-	uint16_t fNcmNdpAlign;    // wNdpOutAlignment (min 4).
-	uint16_t fNcmModulus;     // wNdpOutDivisor (min 4).
-	uint16_t fNcmRemainder;   // wNdpOutPayloadRemainder.
-	uint16_t fNcmMaxDatagrams;// wNtbOutMaxDatagrams (<= 40).
-	uint16_t fNcmMaxNdpSize;  // 16 + (maxDatagrams+1)*4.
-	uint16_t fNcmSeq;         // NTB sequence number.
-	uint32_t fNcmMaxDatagram; // Max frame size (MTU + 14).
-	// TX NTB under construction (copy-based fill, protocol-independent of
-	// TX_ZEROCOPY): the NDP sits in the fill buffer after the NTH; its
-	// entries are recorded here and materialized by 'ncmFlushNtb'.
-	uint32_t fTxNdpOffset;    // NDP offset within the fill buffer.
-	struct {
-		uint16_t index;       // Datagram offset within the NTB.
-		uint16_t len;         // Datagram length.
-	} fTxNdpEntries[NCM_DPT_DATAGRAMS_MAX];
-	int fTxNdpCount;
-#endif
 
-	// RX zero-copy: a read could not be re-armed because 'allocatePacket'
-	// failed; the flush timer retries until a buffer becomes available.
+	// Retry inactive RX slots independently of the TX aggregation deadline.
+	IOTimerEventSource *fRxRetryTimer;
+	bool fRxTimerArmed;
 	bool fNeedReadRestart;
 	// RX reader recovery: consecutive submit failures + the retry interval
 	// (exponential backoff). Transient USB errors (device suspend, stalls)
@@ -600,15 +471,16 @@ private:
 	static void dataReadComplete(void *obj, void *param, IOReturn ior, UInt32 transferred);
 	static void dataIntReadComplete(void *obj, void *param, IOReturn ior, UInt32 transferred);
 	static void txFlushTimerFired(OSObject *owner, IOTimerEventSource *timer);
+	static void rxRetryTimerFired(OSObject *owner, IOTimerEventSource *timer);
 	static void ctrlTimerFired(OSObject *owner, IOTimerEventSource *timer);
 
 	bool grabFillBuffer(void);
 	bool submitFillBuffer(void);
 	void armTxFlushTimer(uint32_t us = TX_FLUSH_US);
+	void armRxRetryTimer(uint32_t us = TX_FLUSH_US);
 	bool startRead(pipebuf_t *inbuf);
 	void releaseReadBuffer(pipebuf_t *inbuf);
-#if RX_ZEROCOPY || NCM_SUPPORT
-	// (NCM requires RX_ZEROCOPY, so these are compiled together.)
+#if RX_ZEROCOPY
 	static void rxClusterFreed(caddr_t extbuf, u_int extsize, caddr_t extarg);
 	void receivePacketZeroCopy(pipebuf_t *slot, UInt32 size);
 	bool submitClusterPacket(uint8_t *data, UInt32 len, RxBufLease *lease);
@@ -621,19 +493,9 @@ private:
 	void handleIndication(uint32_t status);
 	void handleInterruptData(const void *data, UInt32 len);
 	bool updatePacketFilter(void);
+	static IOReturn setFilterModeGated(OSObject *owner, void *kind,
+		void *active, void *unused0, void *unused1);
 
-#if NCM_SUPPORT
-	// NCM protocol layer:
-	IOReturn ncmControlRequest(uint8_t bRequest, uint16_t wValue,
-		void *data, uint16_t wLength, bool isIn);
-	bool ncmInit(void);
-	bool ncmSetPacketFilter(uint32_t filter);
-	bool ncmAppendPacket(mbuf_t packet, size_t pktlen);
-	void ncmFlushNtb(void);
-	void ncmReceivePacket(pipebuf_t *slot, UInt32 size);
-	void ncmHandleNotification(const void *data, UInt32 len);
-	void ncmFallbackMAC(void);
-#endif
 
 	bool rndisInit();
 	// 'rndisCommand' wraps the implementation in
