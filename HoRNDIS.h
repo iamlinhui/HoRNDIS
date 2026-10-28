@@ -77,7 +77,9 @@ extern "C"
 // 1 = aggregate (timer-flushed), 0 = one transfer per packet (legacy
 // behavior). Keep the escape hatch in case a device's RNDIS firmware
 // mishandles multi-PDU data messages.
+#ifndef TX_AGGREGATE
 #define TX_AGGREGATE            1
+#endif
 
 // How long the aggregated TX buffer is allowed to sit partially filled
 // before it is flushed anyway (microseconds). Lower = less added latency,
@@ -101,7 +103,9 @@ extern "C"
 // instead of copying payload bytes into a wired buffer. 0 = copy path.
 //
 // TEMPORARILY 0: same bisection as RX_ZEROCOPY above.
+#ifndef TX_ZEROCOPY
 #define TX_ZEROCOPY             0
+#endif
 
 // NCM_SUPPORT: additionally implement the CDC Network Control Model
 // (Ethernet over USB, NTB16) protocol alongside RNDIS. The protocol is
@@ -117,11 +121,9 @@ extern "C"
 // tether segment. 0 = legacy always-open filter (RNDIS_DEFAULT_FILTER).
 #define RNDIS_DYNAMIC_FILTER    1
 
-// RNDIS_KEEPALIVE: send REMOTE_NDIS_KEEPALIVE_MSG on the control channel
-// every RNDIS_KEEPALIVE_US while the interface is up (per [MS-RNDIS] the
-// host SHOULD do this). Fire-and-forget: the response is drained by the
-// next command's response loop. 0 = disable.
-#define RNDIS_KEEPALIVE         1
+// The legacy fire-and-forget keepalive does not consume responses promptly.
+// Keep it disabled until a serialized, response-aware implementation exists.
+#define RNDIS_KEEPALIVE         0
 #define RNDIS_KEEPALIVE_US      5000000
 
 // Control channel timing: 'rndisCommand' waits up to
@@ -303,6 +305,7 @@ struct rndis_set_c {
 
 #define USB_CDC_SEND_ENCAPSULATED_COMMAND       0x00
 #define USB_CDC_GET_ENCAPSULATED_RESPONSE       0x01
+#define USB_CDC_UNION_TYPE                      0x06
 
 /***** CDC NCM definitions -- from linux/include/linux/usb/cdc_ncm.h,
  ***** include/uapi/linux/usb/cdc.h and drivers/net/usb/cdc_ncm.c *****/
@@ -315,7 +318,6 @@ struct rndis_set_c {
 
 // Functional descriptor subtypes (bDescriptorType == 0x24, CS_INTERFACE):
 #define USB_CDC_HEADER_TYPE     0x00
-#define USB_CDC_UNION_TYPE      0x06
 #define USB_CDC_ETHERNET_TYPE   0x0F
 #define USB_CDC_NCM_TYPE        0x1A
 
@@ -401,8 +403,7 @@ struct ncm_ntb_parameters {
 // itself, so an outstanding lease outlives even the driver instance.
 struct RxBufLease {
 	IOBufferMemoryDescriptor *mdp;
-	SInt32 count;        // Outstanding clusters (atomic).
-	bool freeWhenDone;   // Set at teardown: free on the last release.
+	SInt32 count;        // Atomic references: one slot owner plus attached clusters.
 };
 
 typedef struct {
@@ -535,7 +536,11 @@ private:
 	bool fHasHardwareAddress;
 	
 	uint32_t rndisXid;  // RNDIS request_id count.
-	int32_t maxOutTransferSize;  // Set by 'rdisInit' from device reply.
+	uint32_t maxOutTransferSize;  // Device limit, capped by OUT_BUF_SIZE.
+	uint32_t fRndisMaxPackets;
+	uint32_t fRndisAlignment;
+	uint32_t fTxPacketCount;
+	uint32_t fRndisLastMessageOffset;
 
 	pipebuf_t outbufs[N_OUT_BUFS];
 	// Allow double-buffering to enable the best hardware utilization:

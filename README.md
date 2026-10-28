@@ -35,8 +35,16 @@ sudo kextload /Library/Extensions/HoRNDIS.kext
 ## Building the source
 
 * `git clone` the repository
-* Simply running xcodebuild in the checkout directory should be sufficient to build the kext.
-* If you wish to package it up, you can run `make` to assemble the package in the build/ directory
+* Install full Xcode (not only Command Line Tools). If `xcode-select -p` points to Command Line Tools, select Xcode for this shell without changing the system-wide selection, for example:
+
+  ```sh
+  export DEVELOPER_DIR=/Applications/Xcode-16.4.0.app/Contents/Developer
+  xcodebuild -project HoRNDIS.xcodeproj -configuration Release \
+    CODE_SIGNING_ALLOWED=NO ONLY_ACTIVE_ARCH=NO build
+  ```
+
+* The project uses the installed macOS SDK and targets macOS 10.13 or later. Xcode 16.4 with the macOS 15.5 SDK has been used to compile Release and Debug; this does not establish compatibility with all target macOS versions.
+* Run `make CODESIGN_INST=none` to assemble a package under `build/`. By default the kext is **unsigned**, even if the installer package is signed. To supply kext signing settings, override `XCODEBUILD_FLAGS` explicitly. A successful build or package does not guarantee that macOS will permit the kext to load; kernel-extension signing and system security requirements must be met.
 
 ## Performance Tuning
 
@@ -49,41 +57,43 @@ configuration:
 | `OUT_BUF_SIZE` | `16384` | TX buffer size. Multiple RNDIS PDUs are packed into one USB transfer (RNDIS data messages carry "1-N packets" per the spec). |
 | `TX_AGGREGATE` | `1` | `1` = aggregate several packets per transfer (timer-flushed); `0` = one transfer per packet (legacy behavior). Set to `0` if a device's RNDIS firmware mishandles multi-PDU messages. |
 | `TX_FLUSH_US` | `1000` | How long a partially-filled TX aggregate waits before being flushed (µs). Lower = less added latency; higher = better small-packet aggregation. |
-| `RX_ZEROCOPY` | `1` | Received packets are handed to the stack as mbuf clusters referencing the USB receive buffer (`mbuf_attachcluster` + a per-buffer lease refcount) instead of being copied. `0` = legacy copy path. |
+| `RX_ZEROCOPY` | `0` | `0` uses the copy-based RX path. `1` uses mbuf clusters referencing USB receive buffers; this experimental path needs hardware validation. NCM is not claimed with the default `0`. |
 | `N_IN_BUFS` | `2` | Concurrent in-flight RX transfers. `2` wins on USB3 full-duplex links; on a device that still negotiates USB2, `1` may perform better (half-duplex bus contention). |
 | `RNDIS_DYNAMIC_FILTER` | `1` | Keep the device's packet filter minimal (unicast+broadcast), adding multicast-all / promiscuous only while the network stack asks for them. Stops the host from receiving every frame on the tether segment. `0` = legacy always-open filter. |
-| `RNDIS_KEEPALIVE` | `1` | Send `REMOTE_NDIS_KEEPALIVE_MSG` on the control channel every 5 s while the interface is up, per the RNDIS spec (fire-and-forget; the response is drained by the next command). |
+| `RNDIS_KEEPALIVE` | `0` | Disabled: the legacy fire-and-forget implementation does not consume responses promptly. A response-aware implementation is needed before enabling it. |
 | `RNDIS_CMD_RETRIES` / `RNDIS_CMD_WAIT_US` | `10` / `10000` | Control command patience: up to 10 waits of 10 ms for the device to produce a response. |
-| `TX_ZEROCOPY` | `1` | The outbound RNDIS transfer is an mbuf chain submitted through a scatter-gather descriptor (per-mbuf `withAddress` + `IOMultiMemoryDescriptor`) instead of copying payload bytes. `0` = copy-based aggregation. |
+| `TX_ZEROCOPY` | `0` | `0` uses copy-based transmission. `1` uses scatter-gather descriptors and is experimental; validate it on the target device before use. |
 | `NCM_SUPPORT` | `1` | Additionally implement CDC NCM (Ethernet over USB, NTB16). The protocol is chosen at probe time: a `02/0D/00` control interface picks NCM, the RNDIS personalities keep RNDIS. NCM requires `RX_ZEROCOPY=1`. Set to `0` for a pure RNDIS build. |
 
 ### RNDIS protocol layer
 
 The control channel was reworked to follow the RNDIS-over-USB mapping:
 
-- The control interface's **interrupt endpoint is now opened**: response-available
-  notifications wake pending commands, and `MEDIA_CONNECT` / `MEDIA_DISCONNECT`
-  indications drive the reported link state (e.g. the stack fails over when the
-  module drops the connection). Devices without an interrupt pipe fall back to
-  bounded polling.
+- The control interface's interrupt endpoint is opened to wake pending
+  commands on response-available notifications; bounded polling is the fallback.
+  Media indication handling and unsolicited-response draining remain incomplete;
+  do not rely on reported link state as proof that mobile data is connected.
 - `rndisCommand` no longer busy-waits with `IOSleep` while holding the command
   gate: it sleeps with the **gate released** and serializes concurrent callers.
 - The **packet filter** now follows the stack's multicast/promiscuous requests
   instead of being permanently wide open.
 - The **MAC address is queried once** and cached for the lifetime of the driver
   instance.
-- If the receive path dies while the device is still attached, the driver now
-  reports **link down** instead of pretending everything is fine.
+- Receive failures are retried; reconnect and link-state behavior should still
+  be verified on each device and operating-system version.
 
-Expected effects on a SuperSpeed (USB 3.x) device: RX is zero-copy, and TX
-transfers carry ~10 full-size frames each, removing most per-transfer
-overhead. The advertised medium speed now follows the negotiated USB speed
-(5 Gb/s for SuperSpeed instead of always 480 Mb/s).
+The default copy-based TX path can aggregate frames to reduce transfer overhead;
+actual aggregation is limited by the device's negotiated capabilities. RX and
+TX zero-copy remain disabled pending hardware validation. The network medium
+currently reports 5 Gb/s for any SuperSpeed link, including 10 Gb/s links; use
+System Information → USB to check the actual USB connection speed.
 
 ### CDC NCM support
 
-With `NCM_SUPPORT=1` (default) the driver speaks **both** protocols and picks
-one at probe time:
+The NCM implementation is compiled with `NCM_SUPPORT=1`, but the current
+default `RX_ZEROCOPY=0` deliberately declines NCM interfaces. Enabling
+`RX_ZEROCOPY=1` enables NCM matching; that experimental configuration still
+requires device and lifetime testing. When enabled, probe selects the protocol:
 
 - A control interface with class/subclass/protocol `02/0D/00` (CDC Network
   Control Model) selects **NCM**; the data interface is located via the CDC
@@ -93,11 +103,12 @@ one at probe time:
 
 The NCM layer follows Linux `cdc_ncm.c`: NTB16 format, `GET_NTB_PARAMETERS`
 negotiation (sizes clamped to 2K-64K), `SET_NTB_INPUT_SIZE` before RX, NDP
-table parsing with zero-copy `mbuf_split` extraction, TX NTB aggregation
+table parsing with zero-copy cluster extraction, TX NTB aggregation
 with the device's datagram alignment rules, and CDC `NETWORK_CONNECTION`
 notifications driving the link state. If the data interface exposes **two
 bulk endpoint pairs**, both are used (concurrent RX reads, alternating TX
-submits). NCM requires `RX_ZEROCOPY=1`.
+submits). NCM requires `RX_ZEROCOPY=1`. Devices requiring a non-default
+alternate setting for their bulk endpoints are not yet supported by this path.
 
 For a module like the TD Tech MT5700M-CN:
 
@@ -133,7 +144,7 @@ log stream --predicate 'process == "kernel"' | grep HoRNDIS
 ### What to check on the target device
 
 1. **USB speed negotiated**: *System Report → Hardware → USB* — the device
-   should show `Up to 5 Gb/s`. If it says `Up to 480 Mb/s`, the enclosure,
+   should show a SuperSpeed rate such as `Up to 5 Gb/s` or `Up to 10 Gb/s`. If it says `Up to 480 Mb/s`, the enclosure,
    adapter or cable is USB2 and no driver change will lift that cap.
 2. **Throughput**: `iperf3` between the Mac and a host behind the tether;
    compare with `TX_AGGREGATE=0` / `RX_ZEROCOPY=0` builds to isolate which

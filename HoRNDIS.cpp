@@ -185,27 +185,33 @@ static inline bool isNCMControlInterface(const InterfaceDescriptor *idesc) {
 		&& idesc->bInterfaceProtocol == 0;
 }
 
+#endif
+
 // Parse the CDC Union functional descriptor from a control interface's
 // extra descriptor bytes; returns the subordinate (data) interface number,
 // or -1 when absent/malformed.
-static inline int getUnionDataIfNum(const InterfaceDescriptor *idesc) {
-	const uint8_t *p = (const uint8_t *)idesc + 9;  // Past the fixed fields.
-	int remaining = idesc->bLength - 9;
-	while (remaining >= 3) {
+static inline int getUnionDataIfNum(const ConfigurationDescriptor *config,
+		const InterfaceDescriptor *idesc) {
+	const uint8_t *base = (const uint8_t *)config;
+	const uint8_t *p = (const uint8_t *)idesc;
+	const uint8_t *end = base + ((uint16_t)base[2] | ((uint16_t)base[3] << 8));
+	if (p < base || p >= end || end - p < 2 || p[0] < 2 || p[0] > end - p) {
+		return -1;
+	}
+	p += p[0];
+	while (end - p >= 2) {
 		uint8_t len = p[0];
-		if (len < 3 || len > remaining) {
-			break;  // Malformed extra bytes.
+		if (len < 2 || len > end - p || p[1] == 4 /* INTERFACE */) {
+			break;
 		}
-		if (p[1] == 0x24 /* CS_INTERFACE */ &&
-			p[2] == USB_CDC_UNION_TYPE) {
-			return (len >= 5) ? p[4] : -1;  // bSubordinateInterface0.
+		if (len >= 5 && p[1] == 0x24 /* CS_INTERFACE */ &&
+			p[2] == USB_CDC_UNION_TYPE && p[3] == idesc->bInterfaceNumber) {
+			return p[4];
 		}
 		p += len;
-		remaining -= len;
 	}
 	return -1;
 }
-#endif
 
 bool HoRNDIS::init(OSDictionary *properties) {
 	extern kmod_info_t kmod_info;  // Getting the version from generated file.
@@ -544,7 +550,10 @@ bool HoRNDIS::openUSBInterfaces(IOService *provider) {
 	{  // Now, find the interfaces:
 		OSIterator *iterator = device->getChildIterator(gIOServicePlane);
 		OSObject *obj = NULL;
-		while(iterator != NULL && (obj = iterator->getNextObject()) != NULL) {
+		// Open control first, regardless of the order in the registry.
+		for (int pass = 0; iterator != NULL && pass < 2; pass++) {
+		iterator->reset();
+		while((obj = iterator->getNextObject()) != NULL) {
 			IOUSBHostInterface *iface = OSDynamicCast(IOUSBHostInterface, obj);
 			if (iface == NULL) {
 				continue;
@@ -555,30 +564,33 @@ bool HoRNDIS::openUSBInterfaces(IOService *provider) {
 			}
 			const InterfaceDescriptor *desc = iface->getInterfaceDescriptor();
 			uint8_t ifaceNum = desc->bInterfaceNumber;
-			if (!fCommInterface && ifaceNum == fProbeCommIfNum) {
+			if (pass == 0 && !fCommInterface && ifaceNum == fProbeCommIfNum) {
 				LOG(V_DEBUG, "Found control interface: %d/%d/%d, opening",
 					desc->bInterfaceClass, desc->bInterfaceSubClass,
 					desc->bInterfaceProtocol);
 				if (!iface->open(this)) {
 					LOG(V_ERROR, "Could not open RNDIS control interface");
+					OSSafeReleaseNULL(iterator);
 					return false;
 				}
 				// Note, we retain AFTER opening the interface, because once
 				// 'fCommInterface' is set, the 'closeUSBInterfaces' would
 				// always try to close it before releasing:
 				fCommInterface = retainT(iface);
-			} else if (ifaceNum == fProbeDataIfNum) {
+			} else if (pass == 1 && fCommInterface && !fDataInterface && ifaceNum == fProbeDataIfNum) {
 				LOG(V_DEBUG, "Found data interface: %d/%d/%d, opening",
 					desc->bInterfaceClass, desc->bInterfaceSubClass,
 					desc->bInterfaceProtocol);
 				if (!iface->open(this)) {
 					LOG(V_ERROR, "Could not open RNDIS data interface");
+					OSSafeReleaseNULL(iterator);
 					return false;
 				}
 				// open before retain, see above:
 				fDataInterface = retainT(iface);
 				break;  // We should be done by now.
 			}
+		}
 		}
 		OSSafeReleaseNULL(iterator);
 	}
@@ -722,7 +734,7 @@ IOService *HoRNDIS::probe(IOService *provider, SInt32 *score) {
 	uint8_t dataIfNum;
 #if NCM_SUPPORT
 	if (ncm) {
-		int dnum = getUnionDataIfNum(desc);
+		int dnum = getUnionDataIfNum(configDesc, desc);
 		if (dnum < 0) {
 			LOG(V_DEBUG, "NCM control interface without a Union descriptor");
 			return NULL;
@@ -731,13 +743,19 @@ IOService *HoRNDIS::probe(IOService *provider, SInt32 *score) {
 	} else
 #endif
 	{
-		dataIfNum = desc->bInterfaceNumber + 1;
+		int dnum = getUnionDataIfNum(configDesc, desc);
+		if (dnum < 0 && desc->bInterfaceNumber == 255) return NULL;
+		dataIfNum = dnum >= 0 ? (uint8_t)dnum : desc->bInterfaceNumber + 1;
 	}
 
-	const InterfaceDescriptor *dataDesc =
-		StandardUSB::getNextInterfaceDescriptor(configDesc, desc);
-	bool match = isCDCDataInterface(dataDesc) &&
-		(dataDesc->bInterfaceNumber == dataIfNum);
+	const InterfaceDescriptor *dataDesc = NULL;
+	bool match = false;
+	while ((dataDesc = StandardUSB::getNextInterfaceDescriptor(configDesc, dataDesc)) != NULL) {
+		if (dataDesc->bInterfaceNumber == dataIfNum && isCDCDataInterface(dataDesc)) {
+			match = true;
+			break;
+		}
+	}
 	if (!match) {
 		LOG(V_DEBUG, "Could not find the CDC data interface (number %d)",
 			dataIfNum);
@@ -778,29 +796,32 @@ IOService *HoRNDIS::probeDevice(IOUSBHostDevice *device, SInt32 *score) {
 			// Union descriptor for NCM, control+1 for RNDIS):
 #if NCM_SUPPORT && RX_ZEROCOPY
 			if (isNCMControlInterface(intDesc)) {
-				int dnum = getUnionDataIfNum(intDesc);
+				int dnum = getUnionDataIfNum(configDesc, intDesc);
 				if (dnum >= 0) {
 					controlIfNum = intDesc->bInterfaceNumber;
 					dataIfNum = dnum;
 					proto = kProtocolNCM;
+				} else {
 					continue;
 				}
-			}
+			} else
 #endif
-			if (isRNDISControlInterface(intDesc)) {  // Just check them all.
+			if (isRNDISControlInterface(intDesc)) {
 				controlIfNum = intDesc->bInterfaceNumber;
-				dataIfNum = controlIfNum + 1;
+				dataIfNum = getUnionDataIfNum(configDesc, intDesc);
+				if (dataIfNum < 0) dataIfNum = controlIfNum + 1;
 				proto = kProtocolRNDIS;
+			} else {
 				continue;
 			}
-		
-			// We check for the data interface AND make sure it is the one
-			// paired with the control interface found above:
-			if (controlIfNum >= 0 && isCDCDataInterface(intDesc) &&
-				intDesc->bInterfaceNumber == dataIfNum) {
-				foundData = true;
-				break;
+			const InterfaceDescriptor *data = NULL;
+			while ((data = StandardUSB::getNextInterfaceDescriptor(configDesc, data)) != NULL) {
+				if (data->bInterfaceNumber == dataIfNum && isCDCDataInterface(data)) {
+					foundData = true;
+					break;
+				}
 			}
+			if (foundData) break;
 		}
 		if (foundData) {
 			// We've found it! Save the information and return:
@@ -984,6 +1005,7 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 	}
 
 	if (!allocateResources()) {
+		releaseResources();
 		return kIOReturnNoMemory;
 	}
 
@@ -994,6 +1016,7 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 	fMulticastEnabled = false;
 	fPromiscEnabled = false;
 	if (!updatePacketFilter()) {
+		rtn = kIOReturnError;
 		goto bailout;
 	}
 
@@ -1029,6 +1052,7 @@ IOReturn HoRNDIS::enable(IONetworkInterface *netif) {
 	}
 	if (startedReads == 0) {
 		LOG(V_ERROR, "Failed to start any read");
+		rtn = kIOReturnError;
 		goto bailout;
 	}
 	if (startedReads < N_IN_BUFS) {
@@ -1275,8 +1299,7 @@ bool HoRNDIS::allocateResources() {
 				return false;
 			}
 			lease->mdp->setLength(inSize);
-			lease->count = 0;
-			lease->freeWhenDone = false;
+			lease->count = 1; // Slot owns one reference until teardown.
 			inbufs[i].lease = lease;
 			inbufs[i].mdp = lease->mdp;
 			LOG(V_PTR, "PTR: inbuf[%d].mdp: %p", i, inbufs[i].mdp);
@@ -1376,16 +1399,14 @@ void HoRNDIS::releaseResources() {
 		inbufs[i].dmaBuf = NULL;
 		RxBufLease *lease = inbufs[i].lease;
 		if (lease) {
-			if (lease->count == 0) {
-				lease->mdp->release();
-				IOFree(lease, sizeof(*lease));
-			} else {
-				// Outstanding cluster references: the mbuf free callback
-				// retires the lease once the last one is released.
-				lease->freeWhenDone = true;
-			}
 			inbufs[i].lease = NULL;
 			inbufs[i].mdp = NULL;
+			// Drop the slot's owner reference. The final cluster or the slot
+			// itself retires the descriptor exactly once.
+			if (__atomic_fetch_sub(&lease->count, 1, __ATOMIC_ACQ_REL) == 1) {
+				lease->mdp->release();
+				IOFree(lease, sizeof(*lease));
+			}
 		}
 	}
 
@@ -1499,8 +1520,8 @@ IOReturn HoRNDIS::getHardwareAddress(IOEthernetAddress *ea) {
 	// The function may return different results for the same device.
 
 	rv = rndisQuery(buf, OID_802_3_PERMANENT_ADDRESS, 48, (void **) &bp, &rlen);
-	if (rv < 0) {
-		LOG(V_ERROR, "getHardwareAddress OID failed?");
+	if (rv != 0 || rlen != 6) {
+		LOG(V_ERROR, "getHardwareAddress OID failed or returned an invalid address length");
 		IOFreeAligned(buf, RNDIS_CMD_BUF_SZ);
 		return kIOReturnIOError;
 	}
@@ -1606,7 +1627,7 @@ static IOMemoryDescriptor *descriptorForChain(mbuf_t m) {
 // freed: retire the lease (and its buffer) if teardown requested it.
 void HoRNDIS::rxClusterFreed(caddr_t extbuf, u_int extsize, caddr_t extarg) {
 	RxBufLease *lease = (RxBufLease *)extarg;
-	if (OSAddAtomic(-1, &lease->count) == 0 && lease->freeWhenDone) {
+	if (__atomic_fetch_sub(&lease->count, 1, __ATOMIC_ACQ_REL) == 1) {
 		lease->mdp->release();
 		IOFree(lease, sizeof(*lease));
 	}
@@ -1626,13 +1647,15 @@ bool HoRNDIS::submitClusterPacket(uint8_t *data, UInt32 len,
 	// Attach the external cluster DIRECTLY to this packet-header mbuf
 	// (mbuf_attachcluster supports a caller-supplied mbuf): the result is
 	// a single mbuf, M_PKTHDR|M_EXT, whose data starts at the frame bytes.
+	// Take the cluster reference before publishing the buffer callback.
+	__atomic_fetch_add(&lease->count, 1, __ATOMIC_RELAXED);
 	if (mbuf_attachcluster(MBUF_WAITOK, MBUF_TYPE_DATA, &m,
 			(caddr_t)data, &HoRNDIS::rxClusterFreed, len,
 			(caddr_t)lease) != 0) {
+		__atomic_fetch_sub(&lease->count, 1, __ATOMIC_RELEASE);
 		freePacket(m);
 		return false;
 	}
-	OSIncrementAtomic(&lease->count);
 	mbuf_pkthdr_setlen(m, len);
 	fNetworkInterface->inputPacket(m, len);
 	fpNetStats->inputPackets++;
@@ -1655,6 +1678,8 @@ bool HoRNDIS::grabFillBuffer() {
 	}
 	numFreeOutBufs--;
 	fTxFillOffset = 0;
+	fTxPacketCount = 0;
+	fRndisLastMessageOffset = 0;
 #if NCM_SUPPORT
 	if (fProtocol == kProtocolNCM) {
 		// Reserve the NTB headers: NTH + alignment pad + NDP:
@@ -1707,6 +1732,8 @@ bool HoRNDIS::submitFillBuffer() {
 			freePacket(fTxHead);
 			fTxHead = NULL;
 			fTxBytes = 0;
+			fpNetStats->outputErrors += fTxPacketCount;
+			fTxPacketCount = 0;
 			return true;  // Keep the (now empty) fill slot.
 		}
 		// The descriptor length is the sum of the per-mbuf lengths, which
@@ -1728,7 +1755,7 @@ bool HoRNDIS::submitFillBuffer() {
 				LOG(V_DEBUG, "WRITER: The device was possibly disconnected: ignoring the error");
 			} else {
 				LOG(V_ERROR, "write failed: %08x", ior);
-				fpNetStats->outputErrors++;
+				fpNetStats->outputErrors += (fProtocol == kProtocolRNDIS ? fTxPacketCount : 1);
 			}
 			outbuf.dmaBuf->release();
 			outbuf.dmaBuf = NULL;
@@ -1742,7 +1769,7 @@ bool HoRNDIS::submitFillBuffer() {
 		}
 
 		fCallbackCount++;
-		fpNetStats->outputPackets++;
+		fpNetStats->outputPackets += (fProtocol == kProtocolRNDIS ? fTxPacketCount : 1);
 		fTxFillBufIdx = -1;
 		fTxTimerArmed = false;
 		return grabFillBuffer();
@@ -1773,7 +1800,7 @@ bool HoRNDIS::submitFillBuffer() {
 				LOG(V_DEBUG, "WRITER: The device was possibly disconnected: ignoring the error");
 			} else {
 				LOG(V_ERROR, "write failed: %08x", ior);
-				fpNetStats->outputErrors++;
+				fpNetStats->outputErrors += (fProtocol == kProtocolRNDIS ? fTxPacketCount : 1);
 			}
 			outbufStack[numFreeOutBufs] = (uint16_t)fTxFillBufIdx;
 			numFreeOutBufs++;
@@ -1784,7 +1811,7 @@ bool HoRNDIS::submitFillBuffer() {
 		}
 
 		fCallbackCount++;
-		fpNetStats->outputPackets++;
+		fpNetStats->outputPackets += (fProtocol == kProtocolRNDIS ? fTxPacketCount : 1);
 		fTxFillBufIdx = -1;
 		fTxFillOffset = 0;
 		fTxTimerArmed = false;
@@ -1834,17 +1861,34 @@ void HoRNDIS::txFlushTimerFired(OSObject *owner, IOTimerEventSource *timer) {
 	// all slots busy). 'startRead' guards slot readiness itself. This
 	// works in both copy and zero-copy modes.
 	if (me->fNeedReadRestart) {
+		bool failedSubmit = false;
+		bool anyInFlight = false;
 		me->fNeedReadRestart = false;
 		for (int i = 0; i < N_IN_BUFS; i++) {
-			if (me->startRead(&me->inbufs[i])) {
-				// A successful restart means the reader is healthy:
-				me->fRxFailCount = 0;
-				me->fRxRetryUs = TX_FLUSH_US;
+			pipebuf_t *slot = &me->inbufs[i];
+			if (slot->inFlight) {
+				anyInFlight = true;
+				continue;
+			}
+			// A stack-held cluster is not a USB error; retry after it drains.
+			if (slot->lease && __atomic_load_n(&slot->lease->count, __ATOMIC_ACQUIRE) != 1) {
+				me->fNeedReadRestart = true;
+				continue;
+			}
+			if (me->startRead(slot)) {
+				anyInFlight = true;
 			} else {
+				failedSubmit = true;
 				me->fNeedReadRestart = true;
 			}
 		}
 		if (me->fNeedReadRestart) {
+			if (failedSubmit) {
+				if (!anyInFlight && ++me->fRxFailCount >= 60) {
+					me->setLinkStatus(kIONetworkLinkValid, 0);
+				}
+				me->fRxRetryUs = min(me->fRxRetryUs * 2, (uint32_t)1000000);
+			}
 			me->armTxFlushTimer(me->fRxRetryUs);
 		}
 	}
@@ -1860,7 +1904,7 @@ bool HoRNDIS::startRead(pipebuf_t *inbuf) {
 	inbuf->comp.parameter = inbuf;
 
 	if (inbuf->inFlight || !inbuf->mdp ||
-		(inbuf->lease && inbuf->lease->count != 0)) {
+		(inbuf->lease && __atomic_load_n(&inbuf->lease->count, __ATOMIC_ACQUIRE) != 1)) {
 		return false;
 	}
 
@@ -1966,15 +2010,15 @@ UInt32 HoRNDIS::outputPacket(mbuf_t packet, void *param) {
 	}
 #endif
 
-	const uint32_t msgLen = (uint32_t)(pktlen + sizeof(struct rndis_data_hdr));
-	
-	if (msgLen > maxOutTransferSize || msgLen > OUT_BUF_SIZE) {
-		LOG(V_ERROR, "packet too large (%ld bytes, maximum can transmit %ld)",
-			pktlen, maxOutTransferSize - sizeof(rndis_data_hdr));
+	if (pktlen > maxOutTransferSize - sizeof(struct rndis_data_hdr)) {
+		LOG(V_ERROR, "packet too large (%ld bytes, maximum can transmit %u)",
+			pktlen, (unsigned)(maxOutTransferSize - sizeof(rndis_data_hdr)));
 		fpNetStats->outputErrors++;
 		freePacket(packet);
 		return kIOReturnOutputDropped;
 	}
+
+	const uint32_t msgLen = (uint32_t)(pktlen + sizeof(struct rndis_data_hdr));
 
 	// Make sure there is a fill buffer to append to:
 	if (fTxFillBufIdx < 0) {
@@ -1984,21 +2028,25 @@ UInt32 HoRNDIS::outputPacket(mbuf_t packet, void *param) {
 		}
 	}
 
-#if TX_AGGREGATE
-	// If the current packet does not fit, flush the aggregate first:
-	{
-#if TX_ZEROCOPY
-		const bool fits = !fTxHead ||
-			(fTxBytes + msgLen <= (uint32_t)OUT_BUF_SIZE);
-#else
-		const bool fits = (fTxFillOffset + msgLen <= OUT_BUF_SIZE);
-#endif
-		if (!fits) {
-			if (!submitFillBuffer()) {
-				// Packet not consumed: stall, keep the packet for later.
-				return kIOOutputStatusRetry | kIOOutputCommandStall;
-			}
+#if TX_AGGREGATE && !TX_ZEROCOPY
+	// Padding belongs to the preceding message, so the next message starts
+	// at the negotiated boundary and parsers can advance by MessageLength.
+	uint32_t pad = fTxPacketCount ?
+		((0U - fTxFillOffset) & (fRndisAlignment - 1)) : 0;
+	if (fTxPacketCount && (fTxPacketCount >= fRndisMaxPackets ||
+		pad > maxOutTransferSize - fTxFillOffset ||
+		msgLen > maxOutTransferSize - fTxFillOffset - pad)) {
+		if (!submitFillBuffer()) {
+			return kIOOutputStatusRetry | kIOOutputCommandStall;
 		}
+		pad = 0;
+	}
+	if (pad) {
+		uint8_t *buf = (uint8_t *)outbufs[fTxFillBufIdx].mdp->getBytesNoCopy();
+		memset(buf + fTxFillOffset, 0, pad);
+		struct rndis_data_hdr *previous = (struct rndis_data_hdr *)(buf + fRndisLastMessageOffset);
+		previous->msg_len = cpu_to_le32(le32_to_cpu(previous->msg_len) + pad);
+		fTxFillOffset += pad;
 	}
 #endif
 
@@ -2049,14 +2097,14 @@ UInt32 HoRNDIS::outputPacket(mbuf_t packet, void *param) {
 	}
 	fTxBytes += msgLen;
 
-	// Flush immediately when full, otherwise let the timer flush the tail:
-	if (fTxBytes >= (uint32_t)OUT_BUF_SIZE) {
-		submitFillBuffer();
-	} else {
-		armTxFlushTimer();
-	}
+	// Conservatively send one packet per zero-copy transfer: this avoids
+	// constructing padding mbufs and works for every negotiated alignment.
+	fTxPacketCount = 1;
+	submitFillBuffer();
 #else
 	// Copy-based append (legacy path):
+	fRndisLastMessageOffset = fTxFillOffset;
+	fTxPacketCount++;
 	struct rndis_data_hdr *hdr = (struct rndis_data_hdr *)
 		((char *)outbufs[fTxFillBufIdx].mdp->getBytesNoCopy() + fTxFillOffset);
 	memset(hdr, 0, sizeof *hdr);
@@ -2070,7 +2118,7 @@ UInt32 HoRNDIS::outputPacket(mbuf_t packet, void *param) {
 
 #if TX_AGGREGATE
 	// Flush immediately when full, otherwise let the timer flush the tail:
-	if (fTxFillOffset >= OUT_BUF_SIZE) {
+	if (fTxFillOffset >= maxOutTransferSize || fTxPacketCount >= fRndisMaxPackets) {
 		submitFillBuffer();
 	} else {
 		armTxFlushTimer();
@@ -2195,7 +2243,9 @@ void HoRNDIS::dataReadComplete(void *obj, void *param, IOReturn rc, UInt32 trans
 		}
 	}
 	if (rearmed) {
-		return;  // Callback continues via the new read.
+		// startRead added a new in-flight callback reference; retire this one.
+		me->callbackExit();
+		return;
 	}
 	me->fNeedReadRestart = true;
 	me->armTxFlushTimer();  // Retry tick (see 'txFlushTimerFired').
@@ -2256,7 +2306,7 @@ void HoRNDIS::receivePacket(void *packet, UInt32 size) {
 		struct rndis_data_hdr *hdr = (struct rndis_data_hdr *)packet;
 		uint32_t msg_len, data_ofs, data_len;
 		
-		if (size <= sizeof(struct rndis_data_hdr)) {
+		if (size < sizeof(struct rndis_data_hdr)) {
 			LOG(V_ERROR, "receivePacket() on too small packet? (size %d)", size);
 			return;
 		}
@@ -2270,12 +2320,13 @@ void HoRNDIS::receivePacket(void *packet, UInt32 size) {
 			return;
 		}
 		
-		if (msg_len > size) {
-			LOG(V_ERROR, "msg_len too big?");
+		if (msg_len > size || msg_len < sizeof(struct rndis_data_hdr)) {
+			LOG(V_ERROR, "invalid msg_len?");
 			return;
 		}
 		
-		if ((data_ofs + data_len + 8) > msg_len) {
+		if (data_len == 0 || data_ofs < sizeof(struct rndis_data_hdr) - 8 ||
+		    data_ofs > msg_len - 8 || data_len > msg_len - 8 - data_ofs) {
 			LOG(V_ERROR, "data bigger than msg?");
 			return;
 		}
@@ -2322,7 +2373,7 @@ void HoRNDIS::receivePacketZeroCopy(pipebuf_t *slot, UInt32 size) {
 		struct rndis_data_hdr *hdr = (struct rndis_data_hdr *)packet;
 		uint32_t msg_len, data_ofs, data_len;
 
-		if (size <= sizeof(struct rndis_data_hdr)) {
+		if (size < sizeof(struct rndis_data_hdr)) {
 			LOG(V_ERROR, "receivePacket() on too small packet? (size %d)",
 				size);
 			return;
@@ -2343,7 +2394,8 @@ void HoRNDIS::receivePacketZeroCopy(pipebuf_t *slot, UInt32 size) {
 			return;
 		}
 
-		if (data_len == 0 || (data_ofs + data_len + 8) > msg_len) {
+		if (data_len == 0 || data_ofs < sizeof(struct rndis_data_hdr) - 8 ||
+		    data_ofs > msg_len - 8 || data_len > msg_len - 8 - data_ofs) {
 			LOG(V_ERROR, "data bigger than msg?");
 			return;
 		}
@@ -2391,6 +2443,11 @@ IOReturn HoRNDIS::rndisCommandGated(OSObject *owner, void *bufArg,
 
 IOReturn HoRNDIS::rndisCommandImpl(struct rndis_msg_hdr *buf, int buflen) {
 	IOReturn rc = kIOReturnSuccess;
+	if (!buf || buflen < (int)sizeof(*buf) || buflen > 0xffff ||
+	    le32_to_cpu(buf->msg_len) < sizeof(*buf) ||
+	    le32_to_cpu(buf->msg_len) > (uint32_t)buflen) {
+		return kIOReturnBadArgument;
+	}
 	if (!fCommInterface) {  // Safety: make sure 'fCommInterface' is valid.
 		LOG(V_ERROR, "fCommInterface is NULL, bailing out");
 		return kIOReturnError;
@@ -2485,23 +2542,35 @@ IOReturn HoRNDIS::rndisCommandImpl(struct rndis_msg_hdr *buf, int buflen) {
 		rq.bRequest = USB_CDC_GET_ENCAPSULATED_RESPONSE;
 		rq.wValue = 0;
 		rq.wIndex = ifNum;
-		rq.wLength = RNDIS_CMD_BUF_SZ;
+		rq.wLength = buflen;
 
 		uint32_t bytes_transferred;
 		if ((rc = fCommInterface->deviceRequest(rq, buf, bytes_transferred)) != kIOReturnSuccess) {
 			goto out;
 		}
 
-		if (bytes_transferred < 12) {
-			LOG(V_ERROR, "short read on control request?");
+		if (bytes_transferred < 12 || bytes_transferred > (uint32_t)buflen) {
+			LOG(V_ERROR, "invalid control response transfer length");
 			continue;
 		}
-		
+		uint32_t response_len = le32_to_cpu(buf->msg_len);
+		if (response_len != bytes_transferred || response_len < 12) {
+			LOG(V_ERROR, "invalid control response message length");
+			continue;
+		}
+
 		if (buf->msg_type == (old_msg_type | RNDIS_MSG_COMPLETION)) {
 			if (buf->request_id == old_request_id) {
 				if (buf->msg_type == RNDIS_MSG_RESET_C) {
 					// This is probably incorrect: the RESET_C does not have
 					// 'request_id', but we don't issue resets => don't care.
+					break;
+				}
+				if (response_len < sizeof(*buf) ||
+				    (buf->msg_type == RNDIS_MSG_QUERY_C && response_len < sizeof(struct rndis_query_c)) ||
+				    (buf->msg_type == RNDIS_MSG_INIT_C && response_len < sizeof(struct rndis_init_c))) {
+					LOG(V_ERROR, "short RNDIS completion");
+					rc = kIOReturnError;
 					break;
 				}
 				if (buf->status != RNDIS_STATUS_SUCCESS) {
@@ -2526,7 +2595,7 @@ IOReturn HoRNDIS::rndisCommandImpl(struct rndis_msg_hdr *buf, int buflen) {
 		} else if (buf->msg_type == RNDIS_MSG_INDICATE) {
 			// Unsolicited status message: act on media state, then keep
 			// waiting for our own completion:
-			handleIndication(le32_to_cpu(buf->status));
+			handleIndication(le32_to_cpu(buf->request_id));
 			continue;
 		} else if (buf->msg_type == RNDIS_MSG_KEEPALIVE) {
 			// Unsolicited keep-alive (some devices poke the host first):
@@ -2580,7 +2649,8 @@ void HoRNDIS::dataIntReadComplete(void *obj, void *param, IOReturn rc, UInt32 tr
 		return;
 	}
 
-	if (rc == kIOReturnSuccess && transferred >= sizeof(struct rndis_msg_hdr)) {
+	// CDC notifications have an 8-byte header, not an RNDIS message header.
+	if (rc == kIOReturnSuccess && transferred >= 8) {
 		me->handleInterruptData(inbuf->mdp->getBytesNoCopy(), transferred);
 	}
 
@@ -2603,17 +2673,13 @@ void HoRNDIS::handleInterruptData(const void *data, UInt32 len) {
 	}
 #endif
 
-	const struct rndis_msg_hdr *hdr = (const struct rndis_msg_hdr *)data;
-
-	// Any notification implies a control-channel response *may* be ready:
-	// wake a sleeping 'rndisCommand' (it re-checks the actual response).
-	if (fCmdWaitActive) {
+	// RESPONSE_AVAILABLE is a CDC notification. Its RNDIS payload is
+	// retrieved separately through GET_ENCAPSULATED_RESPONSE.
+	const uint8_t *notification = (const uint8_t *)data;
+	if (len >= 8 && notification[0] == 0xa1 && notification[1] == 0x01 &&
+	    notification[6] == 0 && notification[7] == 0 && fCmdWaitActive) {
 		fCmdWaitActive = false;
 		getCommandGate()->commandWakeup(&fCmdWaitEvent);
-	}
-
-	if (hdr->msg_type == RNDIS_MSG_INDICATE && len >= 16) {
-		handleIndication(le32_to_cpu(hdr->status));
 	}
 }
 
@@ -2796,6 +2862,9 @@ int HoRNDIS::rndisQuery(void *buf, uint32_t oid, uint32_t in_len, void **reply, 
 	} u;
 	uint32_t off, len;
 	
+	if (!buf || !reply || !reply_len || in_len > RNDIS_CMD_BUF_SZ - sizeof(struct rndis_query)) {
+		return -1;
+	}
 	u.buf = buf;
 	
 	memset(u.get, 0, sizeof(*u.get) + in_len);
@@ -2815,7 +2884,10 @@ int HoRNDIS::rndisQuery(void *buf, uint32_t oid, uint32_t in_len, void **reply, 
 	len = le32_to_cpu(u.get_c->len);
 	LOG(V_DEBUG, "RNDIS query completed");
 	
-	if ((8 + off + len) > RNDIS_CMD_BUF_SZ) {
+	uint32_t msg_len = le32_to_cpu(u.get_c->msg_len);
+	if (msg_len < sizeof(*u.get_c) || msg_len > RNDIS_CMD_BUF_SZ ||
+	    off < sizeof(*u.get_c) - 8 || off > msg_len - 8 ||
+	    len > msg_len - 8 - off) {
 		goto fmterr;
 	}
 	if (*reply_len != -1 && len != *reply_len) {
@@ -2859,6 +2931,12 @@ bool HoRNDIS::rndisInit() {
 		return false;
 	}
 
+	if (le32_to_cpu(u.hdr->msg_len) < sizeof(*u.init_c)) {
+		LOG(V_ERROR, "short RNDIS INIT completion");
+		IOFreeAligned(u.hdr, RNDIS_CMD_BUF_SZ);
+		return false;
+	}
+
 	if (fCommInterface) {  // Safety: don't accesss 'fCommInterface if NULL.
 		LOG(V_NOTE, "'%s': ver=%d.%d, max_packets_per_transfer=%d, "
 			"max_transfer_size=%d, packet_alignment=2^%d",
@@ -2870,12 +2948,23 @@ bool HoRNDIS::rndisInit() {
 			le32_to_cpu(u.init_c->packet_alignment));
 	}
 
-	maxOutTransferSize = le32_to_cpu(u.init_c->max_transfer_size);
-	// For now, let's limit the maxOutTransferSize by the Output Buffer size.
-	// If we implement transmitting multiple PDUs in a single USB transfer,
-	// we may want to size the output buffers based on
-	// "u.init_c->max_transfer_size".
-	maxOutTransferSize = min(maxOutTransferSize, OUT_BUF_SIZE);
+	maxOutTransferSize = min(le32_to_cpu(u.init_c->max_transfer_size),
+		(uint32_t)OUT_BUF_SIZE);
+	if (maxOutTransferSize < sizeof(struct rndis_data_hdr) + 14) {
+		LOG(V_ERROR, "RNDIS INIT advertised unusable TX transfer size %u", maxOutTransferSize);
+		IOFreeAligned(u.hdr, RNDIS_CMD_BUF_SZ);
+		return false;
+	}
+	fRndisMaxPackets = le32_to_cpu(u.init_c->max_packets_per_transfer);
+	uint32_t alignmentExponent = le32_to_cpu(u.init_c->packet_alignment);
+	// Invalid limits must never enable an unconstrained aggregate.
+	if (!fRndisMaxPackets || alignmentExponent > 14) {
+		LOG(V_NOTE, "invalid RNDIS aggregation limits; using single-packet transfers");
+		fRndisMaxPackets = 1;
+		fRndisAlignment = 1;
+	} else {
+		fRndisAlignment = 1U << alignmentExponent;
+	}
 	
 	IOFreeAligned(u.hdr, RNDIS_CMD_BUF_SZ);
 	
