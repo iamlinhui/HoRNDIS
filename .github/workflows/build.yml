@@ -1,84 +1,131 @@
-# Builds the kext on macOS CI so that every push gets a compile check
-# without needing a local Mac.
-#
-# A single arm64 runner (macos-14) is enough: with ONLY_ACTIVE_ARCH=NO the
-# build is universal (x86_64 + arm64e slices in one kext), so the artifact
-# works on both Intel and Apple Silicon Macs. (macos-13 Intel runners are
-# being retired by GitHub and sit in the queue for hours; they add no
-# coverage since x86_64 is cross-compiled on macos-14 anyway.)
-#
-# NOTE: GitHub-hosted macOS runners run with SIP enabled, so the kext
-# cannot be *loaded* here - this pipeline verifies that it BUILDS and
-# links against the kernel KPIs. Runtime verification happens on a real
-# Mac (see README "Verifying a build").
-
-name: build
+# Builds an unsigned RNDIS-only kext. Publishing a GitHub Release triggers a
+# fresh build from its tag and attaches a ZIP and SHA-256 checksum to it.
+# Hosted runners compile only: they cannot validate kext loading or hardware.
+name: Build and release
 
 on:
   push:
   pull_request:
   workflow_dispatch:
+  release:
+    types: [published]
+
+# Checkout and builds need read access; only the release upload job can write.
+permissions:
+  contents: read
 
 jobs:
   build-kext:
-    name: Build (macos-14, universal)
+    name: Build and verify kext
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name || github.sha }}
+          persist-credentials: false
 
-      - name: Build the kext (Release)
+      - name: Show build environment
         run: |
-          xcodebuild -project HoRNDIS.xcodeproj \
-            -target HoRNDIS \
-            -configuration Release \
-            CODE_SIGNING_ALLOWED=NO \
-            ONLY_ACTIVE_ARCH=NO \
-            SDKROOT=macosx \
-            MACOSX_DEPLOYMENT_TARGET=10.13 \
-            build
+          xcodebuild -version
+          sw_vers
+          uname -m
 
-      - name: Build the kext (Debug, verbose packet logs)
+      - name: Build Release and Debug
+        shell: bash
         run: |
-          xcodebuild -project HoRNDIS.xcodeproj \
-            -target HoRNDIS \
-            -configuration Debug \
-            CODE_SIGNING_ALLOWED=NO \
-            ONLY_ACTIVE_ARCH=NO \
-            SDKROOT=macosx \
-            MACOSX_DEPLOYMENT_TARGET=10.13 \
-            build
+          set -euo pipefail
+          for configuration in Release Debug; do
+            xcodebuild -project HoRNDIS.xcodeproj \
+              -target HoRNDIS \
+              -configuration "$configuration" \
+              CODE_SIGNING_ALLOWED=NO \
+              ONLY_ACTIVE_ARCH=NO \
+              ARCHS='x86_64 arm64e' \
+              SDKROOT=macosx \
+              MACOSX_DEPLOYMENT_TARGET=10.13 \
+              build
+          done
 
-      - name: Stage the debug kext
+      - name: Verify both products
+        shell: bash
         run: |
-          rm -rf HoRNDIS-debug.kext
-          cp -R build/Debug/HoRNDIS.kext HoRNDIS-debug.kext
+          set -euo pipefail
+          for configuration in Release Debug; do
+            kext="build/$configuration/HoRNDIS.kext"
+            binary="$kext/Contents/MacOS/HoRNDIS"
+            test -f "$binary"
+            plutil -lint "$kext/Contents/Info.plist"
+            test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$kext/Contents/Info.plist")" = 'com.joshuawise.kexts.HoRNDIS'
+            for arch in x86_64 arm64e; do
+              lipo "$binary" -verify_arch "$arch"
+            done
+            echo "$configuration architectures: $(lipo -archs "$binary")"
+            dwarfdump --uuid "$binary"
+          done
 
-      - name: Upload the debug kext artifact
+      - name: Package release and debug archives
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for configuration in Release Debug; do
+            stage="dist/HoRNDIS-$configuration"
+            mkdir -p "$stage"
+            ditto "build/$configuration/HoRNDIS.kext" "$stage/HoRNDIS.kext"
+            cat > "$stage/RELEASE-NOTES.txt" <<'EOF'
+          HoRNDIS RNDIS-only experimental build
+
+          This kernel extension is unsigned and not notarized. It may be blocked
+          by macOS security policy; installing or loading it can interrupt
+          networking or cause a kernel panic. Do not weaken security settings
+          solely to load this build. Back up an existing working driver first.
+
+          CI checks compilation and archive integrity only. Loading, hardware
+          compatibility, hotplug, suspend, and recovery are not verified by CI.
+          x86_64 and arm64e slices do not imply Apple Silicon support. The driver
+          supports RNDIS only, not CDC-NCM. No installer or installation script
+          is included.
+          EOF
+            ditto -c -k --sequesterRsrc --keepParent "$stage" "dist/HoRNDIS-$configuration.zip"
+            unzip -t "dist/HoRNDIS-$configuration.zip"
+          done
+          (cd dist && shasum -a 256 HoRNDIS-Release.zip HoRNDIS-Debug.zip > SHA256SUMS.txt)
+          cat dist/SHA256SUMS.txt
+
+      - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: HoRNDIS-kext-debug
-          path: HoRNDIS-debug.kext
+          name: HoRNDIS-unsigned-kext
+          path: |
+            dist/HoRNDIS-Release.zip
+            dist/HoRNDIS-Debug.zip
+            dist/SHA256SUMS.txt
           if-no-files-found: error
 
-      - name: Verify the product
-        run: |
-          ls -la build/Release/HoRNDIS.kext
-          # Print the KPI libraries the kext links against:
-          /usr/sbin/kextlibs -xml build/Release/HoRNDIS.kext | head -40
-
-      - name: Link-check without loading (informational)
-        run: |
-          /usr/sbin/kextutil -n build/Release/HoRNDIS.kext || \
-            echo "link-check skipped: expected on CI (unsigned kext + SIP enabled runner)"
-
-      - name: Stage the kext for upload
-        run: |
-          rm -rf HoRNDIS.kext
-          cp -R build/Release/HoRNDIS.kext .
-
-      - name: Upload the kext artifact
-        uses: actions/upload-artifact@v4
+  publish-release:
+    name: Attach assets to published release
+    if: github.event_name == 'release' && github.event.action == 'published'
+    needs: build-kext
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download verified build assets
+        uses: actions/download-artifact@v4
         with:
-          name: HoRNDIS-kext
-          path: HoRNDIS.kext
-          if-no-files-found: error
+          name: HoRNDIS-unsigned-kext
+          path: dist
+
+      - name: Verify archive checksums
+        run: cd dist && sha256sum -c SHA256SUMS.txt
+
+      - name: Upload assets to the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$RELEASE_TAG" \
+            dist/HoRNDIS-Release.zip dist/HoRNDIS-Debug.zip dist/SHA256SUMS.txt
